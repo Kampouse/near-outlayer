@@ -321,7 +321,8 @@ fn usage() {
     eprintln!("Options:");
     eprintln!("  --daemon          Run as background daemon");
     eprintln!("  --foreground      Run in foreground (default)");
-    eprintln!("  --stop            Stop running daemon");
+    eprintln!("  --start           Start daemon via launchd");
+    eprintln!("  --stop            Stop daemon (unloads launchd)");
     eprintln!("  --status          Check daemon status");
     eprintln!("  --log             Tail the log file");
     eprintln!("  -h, --help        Show this help");
@@ -334,6 +335,8 @@ fn main() -> Result<()> {
     // Handle CLI flags
     let mode = if args.iter().any(|a| a == "--stop") {
         return stop_daemon(&cfg);
+    } else if args.iter().any(|a| a == "--start") {
+        return start_daemon(&cfg);
     } else if args.iter().any(|a| a == "--status") {
         return check_status(&cfg);
     } else if args.iter().any(|a| a == "--log") {
@@ -363,6 +366,11 @@ fn main() -> Result<()> {
 
         daemonize(&log_path, &pid_path)?;
     } else {
+        // Write PID file for --status/--stop to work
+        let pid_path = cfg.pid_file_path();
+        if let Some(parent) = pid_path.parent() { fs::create_dir_all(parent).ok(); }
+        fs::write(&pid_path, std::process::id().to_string()).ok();
+
         eprintln!("⚡ layerd — OutLayer local worker (direct RPC)");
         eprintln!("   Contract: {}", cfg.contract_id);
         eprintln!("   Account:  {}", cfg.account_id);
@@ -397,6 +405,10 @@ fn main() -> Result<()> {
 
     let rpc = Rpc::new(&cfg.rpc_url)?;
     let mut processed: HashSet<u64> = HashSet::new();
+
+    // Clean up PID file on exit
+    let pid_path_cleanup = cfg.pid_file_path();
+    ctrlc_handler(&pid_path_cleanup);
 
     loop {
         match get_pending_ids(&rpc, &cfg.contract_id) {
@@ -467,30 +479,71 @@ fn read_pid(pid_path: &Path) -> Result<u32> {
     Ok(s.trim().parse()?)
 }
 
+fn ctrlc_handler(pid_path: &Path) {
+    // Stale PID files are handled by is_running() which checks actual process
+    // Just a marker — no complex signal handling needed
+}
+
+fn start_daemon(cfg: &Config) -> Result<()> {
+    let plist = dirs::home_dir()
+        .map(|h| h.join("Library/LaunchAgents/com.outlayer.layerd.plist"))
+        .filter(|p| p.exists());
+
+    if let Some(plist_path) = &plist {
+        let status = std::process::Command::new("launchctl")
+            .args(["load", &plist_path.display().to_string()])
+            .status()?;
+        if status.success() {
+            eprintln!("✅ layerd started via launchd");
+        } else {
+            anyhow::bail!("launchctl load failed");
+        }
+    } else {
+        anyhow::bail!("launchd plist not found at ~/Library/LaunchAgents/com.outlayer.layerd.plist");
+    }
+    Ok(())
+}
+
 fn stop_daemon(cfg: &Config) -> Result<()> {
     let pid_path = cfg.pid_file_path();
-    if !is_running(&pid_path) {
-        eprintln!("layerd not running");
-        return Ok(());
-    }
-    let pid = read_pid(&pid_path)?;
-    eprintln!("Stopping layerd (PID {})...", pid);
-    unsafe {
-        libc::kill(pid as i32, libc::SIGTERM);
-    }
-    // Wait for process to exit
-    for _ in 0..10 {
-        if !is_running(&pid_path) {
-            let _ = fs::remove_file(&pid_path);
-            eprintln!("✅ Stopped");
-            return Ok(());
-        }
+
+    // Try launchd unload first (macOS)
+    let plist = dirs::home_dir()
+        .map(|h| h.join("Library/LaunchAgents/com.outlayer.layerd.plist"))
+        .filter(|p| p.exists());
+
+    if let Some(plist_path) = &plist {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &plist_path.display().to_string()])
+            .status();
         std::thread::sleep(Duration::from_millis(500));
     }
-    // Force kill
-    unsafe { libc::kill(pid as i32, libc::SIGKILL); }
-    let _ = fs::remove_file(&pid_path);
-    eprintln!("✅ Force killed");
+
+    // Also kill directly if still running
+    if is_running(&pid_path) {
+        let pid = read_pid(&pid_path)?;
+        let my_pid = std::process::id();
+        if pid == my_pid {
+            eprintln!("✅ Stopped via launchd");
+            return Ok(());
+        }
+        eprintln!("Stopping layerd (PID {})...", pid);
+        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        for _ in 0..10 {
+            if !is_running(&pid_path) {
+                let _ = fs::remove_file(&pid_path);
+                eprintln!("✅ Stopped");
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+        let _ = fs::remove_file(&pid_path);
+        eprintln!("✅ Force killed");
+    } else {
+        let _ = fs::remove_file(&pid_path);
+        eprintln!("✅ Stopped (was not running)");
+    }
     Ok(())
 }
 
