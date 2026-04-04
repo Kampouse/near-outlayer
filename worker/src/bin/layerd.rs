@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -18,6 +19,10 @@ use near_primitives::types::BlockReference;
 use near_primitives::types::FunctionArgs;
 use near_primitives::views::QueryRequest;
 
+use offchainvm_worker::api_client::{ExecutionOutput, ResourceLimits, ResponseFormat};
+use offchainvm_worker::config::RpcProxyConfig;
+use offchainvm_worker::executor::{ExecutionContext, Executor};
+use offchainvm_worker::outlayer_rpc::RpcProxy;
 // ── Config ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -279,36 +284,68 @@ fn find_wasm(search_dirs: &[String]) -> Option<PathBuf> {
     None
 }
 
-fn execute_wasm(wasm_path: &Path, input: &str, network: &str) -> Result<(bool, String, u64, u64)> {
-    let rpc = format!("https://rpc.{}.near.org", network);
-    let output = std::process::Command::new("inlayer")
-        .args(["run", &wasm_path.display().to_string(), input, "--rpc", &rpc])
-        .output()
-        .context("inlayer run failed")?;
+fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str) -> Result<(bool, String, u64, u64)> {
+    use offchainvm_worker::api_client::ExecutionOutput;
+    use offchainvm_worker::api_client::{ResourceLimits, ResponseFormat};
+    use offchainvm_worker::config::RpcProxyConfig;
+    use offchainvm_worker::executor::{ExecutionContext, Executor};
+    use offchainvm_worker::outlayer_rpc::RpcProxy;
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let wasm_bytes = fs::read(wasm_path)
+        .with_context(|| format!("reading {}", wasm_path.display()))?;
 
-    let success = stdout.contains("✅ Success: true");
-    let time_ms = extract_num(&stdout, "Time:").or_else(|| extract_num(&stderr, "Time:")).unwrap_or(0);
-    let instructions = extract_num_after(&stdout, "Instructions:").or_else(|| extract_num_after(&stderr, "Instructions:")).unwrap_or(0);
-    let output_text = stdout.lines()
-        .find(|l| l.starts_with("📤 Output:"))
-        .map(|l| l.trim_start_matches("📤 Output: ").to_string())
-        .unwrap_or_default();
+    let storage_dir = env::var("STORAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./storage"));
+    fs::create_dir_all(&storage_dir).ok();
 
-    Ok((success, output_text, time_ms, instructions))
-}
+    // Create RPC proxy
+    let rpc_cfg = RpcProxyConfig {
+        enabled: true,
+        rpc_url: Some(rpc_url.to_string()),
+        max_calls_per_execution: 100,
+        allow_transactions: true,
+    };
+    let proxy = RpcProxy::new(rpc_cfg, rpc_url)?;
 
-fn extract_num(text: &str, prefix: &str) -> Option<u64> {
-    text.lines().find(|l| l.contains(prefix))?
-        .split_whitespace().find_map(|w| w.parse::<u64>().ok())
-}
+    let rt = tokio::runtime::Runtime::new()?;
+    let handle = rt.handle().clone();
 
-fn extract_num_after(text: &str, prefix: &str) -> Option<u64> {
-    let line = text.lines().find(|l| l.contains(prefix))?;
-    let after = line.split(prefix).nth(1)?;
-    after.trim().split_whitespace().next()?.parse().ok()
+    let exec_ctx = ExecutionContext {
+        outlayer_rpc: Some(Arc::new(proxy)),
+        storage_config: None, // local-only fallback via auto-detect
+        runtime_handle: handle,
+        compiled_cache: None,
+        vrf_config: None,
+        wallet_config: None,
+    };
+
+    let executor = Executor::new(10_000_000_000, true).with_context(exec_ctx);
+
+    let limits = ResourceLimits {
+        max_instructions: 10_000_000_000,
+        max_memory_mb: 256,
+        max_execution_seconds: 60,
+    };
+
+    let result = rt.block_on(executor.execute(
+        &wasm_bytes, None, input.as_bytes(), &limits,
+        None, Some("wasm32-wasip2"), &ResponseFormat::Text,
+        None, None, None,
+    ))?;
+
+    let success = result.success;
+    let time_ms = result.execution_time_ms;
+    let instructions = result.instructions;
+    let output = match &result.output {
+        Some(ExecutionOutput::Text(t)) => t.clone(),
+        Some(ExecutionOutput::Json(j)) => serde_json::to_string(j).unwrap_or_default(),
+        Some(ExecutionOutput::Bytes(b)) => format!("{} bytes", b.len()),
+        None => String::new(),
+    };
+
+    std::mem::forget(rt);
+    Ok((success, output, time_ms, instructions))
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -438,7 +475,7 @@ fn main() -> Result<()> {
                         log(&format!("   WASM: {}", wasm.display()));
 
                         log("   🏃 Running...");
-                        match execute_wasm(&wasm, &input, &cfg.network) {
+                        match execute_wasm(&wasm, &input, &cfg.rpc_url) {
                             Ok((success, output, time_ms, instructions)) => {
                                 log(&format!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions));
                                 log(&format!("   📤 {}", output));
