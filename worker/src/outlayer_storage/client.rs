@@ -76,6 +76,11 @@ pub struct StorageClient {
 }
 
 impl StorageClient {
+    /// Returns true if this is a local-only client (no remote coordinator)
+    pub fn is_local(&self) -> bool {
+        self.config.coordinator_url.is_empty()
+    }
+
     /// Create a new storage client
     pub fn new(config: StorageConfig) -> Result<Self> {
         let client = reqwest::blocking::Client::builder()
@@ -84,6 +89,27 @@ impl StorageClient {
             .build()
             .context("Failed to create HTTP client")?;
 
+        Ok(Self { client, config })
+    }
+
+    /// Create a local-only client (no remote coordinator)
+    pub fn new_local() -> Result<Self> {
+        let config = StorageConfig {
+            coordinator_url: String::new(),
+            coordinator_token: String::new(),
+            keystore_url: String::new(),
+            keystore_token: String::new(),
+            project_uuid: String::new(),
+            wasm_hash: String::new(),
+            account_id: String::new(),
+            tee_mode: "local".into(),
+            keystore_tee_session_id: None,
+        };
+        // Build client even though we'll never use it — keeps struct consistent
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_millis(1))
+            .build()
+            .context("Failed to create HTTP client")?;
         Ok(Self { client, config })
     }
 

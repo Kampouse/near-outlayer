@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -37,6 +37,8 @@ struct Config {
     key_path: String,
     log_file: Option<String>,
     pid_file: Option<String>,
+    /// Environment variables to pass to WASM execution
+    env: HashMap<String, String>,
 }
 
 impl Default for Config {
@@ -52,6 +54,7 @@ impl Default for Config {
             key_path: format!("{}/.near-credentials/testnet/kampouse.testnet.json", home.display()),
             log_file: None,
             pid_file: None,
+            env: HashMap::new(),
         }
     }
 }
@@ -284,7 +287,7 @@ fn find_wasm(search_dirs: &[String]) -> Option<PathBuf> {
     None
 }
 
-fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str) -> Result<(bool, String, u64, u64)> {
+fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str, env_vars: &HashMap<String, String>) -> Result<(bool, String, u64, u64)> {
 
     let wasm_bytes = fs::read(wasm_path)
         .with_context(|| format!("reading {}", wasm_path.display()))?;
@@ -323,9 +326,11 @@ fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str) -> Result<(bool, S
         max_execution_seconds: 60,
     };
 
+    let env = if env_vars.is_empty() { None } else { Some(env_vars.clone()) };
+
     let result = rt.block_on(executor.execute(
         &wasm_bytes, None, input.as_bytes(), &limits,
-        None, Some("wasm32-wasip2"), &ResponseFormat::Text,
+        env, Some("wasm32-wasip2"), &ResponseFormat::Text,
         None, None, None,
     ))?;
 
@@ -470,7 +475,7 @@ fn main() -> Result<()> {
                         log(&format!("   WASM: {}", wasm.display()));
 
                         log("   🏃 Running...");
-                        match execute_wasm(&wasm, &input, &cfg.rpc_url) {
+                        match execute_wasm(&wasm, &input, &cfg.rpc_url, &cfg.env) {
                             Ok((success, output, time_ms, instructions)) => {
                                 log(&format!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions));
                                 log(&format!("   📤 {}", output));
