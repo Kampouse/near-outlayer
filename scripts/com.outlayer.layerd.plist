@@ -6,7 +6,8 @@
     <string>com.outlayer.layerd</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/layerd</string>
+        <!-- UPDATE: path to your layerd binary -->
+        <string>/Users/YOU/.inlayer/bin/layerd</string>
         <string>--foreground</string>
     </array>
     <key>RunAtLoad</key>
@@ -14,15 +15,20 @@
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/layerd.log</string>
+    <!-- UPDATE: path to your log file -->
+    <string>/Users/YOU/.inlayer/layerd.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/layerd.log</string>
+    <string>/Users/YOU/.inlayer/layerd.log</string>
     <key>WorkingDirectory</key>
-    <string>/usr/local/var/layerd</string>
+    <string>/Users/YOU/.inlayer</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
-        <string>/Users/newsetup</string>
+        <!-- UPDATE: your home directory -->
+        <string>/Users/YOU</string>
+        <key>PATH</key>
+        <!-- UPDATE: include directory with inlayer binary -->
+        <string>/Users/YOU/.local/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
 </dict>
 </plist>

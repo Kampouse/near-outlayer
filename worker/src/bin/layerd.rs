@@ -410,9 +410,12 @@ fn main() -> Result<()> {
     let pid_path_cleanup = cfg.pid_file_path();
     ctrlc_handler(&pid_path_cleanup);
 
+    let mut consecutive_errors = 0u32;
+
     loop {
         match get_pending_ids(&rpc, &cfg.contract_id) {
             Ok(ids) => {
+                consecutive_errors = 0;
                 if ids.is_empty() {
                     log("No pending");
                 } else {
@@ -453,7 +456,16 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            Err(e) => log(&format!("❌ {}", e)),
+            Err(e) => {
+                consecutive_errors += 1;
+                let backoff = std::cmp::min(
+                    cfg.poll_interval_secs * (1 << std::cmp::min(consecutive_errors, 5)),
+                    300, // max 5 min backoff
+                );
+                log(&format!("❌ {} (backoff {}s, attempt #{})", e, backoff, consecutive_errors));
+                std::thread::sleep(Duration::from_secs(backoff));
+                continue;
+            }
         }
 
         std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
