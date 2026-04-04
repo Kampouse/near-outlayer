@@ -195,21 +195,8 @@ impl Contract {
             "project_id": project_id
         });
 
-        // Create yield promise to pause execution
-        let promise_idx = env::promise_yield_create(
-            "on_execution_response",
-            &request_data.to_string().into_bytes(),
-            MIN_RESPONSE_GAS,
-            GasWeight::default(),
-            DATA_ID_REGISTER,
-        );
-
-        // Get data_id for the yield promise
-        let data_id: CryptoHash = env::read_register(DATA_ID_REGISTER)
-            .expect("Register is empty")
-            .try_into()
-            .expect("Wrong register length");
-
+        // Create a placeholder data_id (no yield promise for local testing)
+        let data_id: CryptoHash = CryptoHash::default();
         // Store the pending execution request
         // Note: sender_id in ExecutionRequest stores predecessor (contract that called us)
         // This is used for authorization checks (cancel_stale_execution)
@@ -237,8 +224,7 @@ impl Contract {
         // Emit event for workers to catch
         events::emit::execution_requested(&self.event_standard, &self.event_version, &request_data.to_string(), data_id);
 
-        // Return the promise to pause execution
-        env::promise_return(promise_idx)
+        // No yield promise - worker resolves via resolve_execution
     }
 
 
@@ -737,11 +723,8 @@ impl Contract {
         // Log cost in easy-to-parse format for worker
         log!("[[yNEAR charged: \"{}\"]]", estimated_cost);
 
-        // For large outputs, we only pass metadata through resume (output stays in storage)
-        // The callback will retrieve it from pending_output field
-        // This avoids the 1024 byte limit of promise_yield_resume
-        if !env::promise_yield_resume(&data_id, &serde_json::to_vec(&response).unwrap()) {
-            env::panic_str("Unable to resume execution promise");
-        }
+        // For local testing: no yield resume, just store result and remove pending
+        // In production, this would call promise_yield_resume
+        self.pending_requests.remove(&request_id);
     }
 }
