@@ -1,133 +1,276 @@
-use offchainvm_worker::api_client::ExecutionOutput;
- ResponseFormat,ResponseOutput,```
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-- Find WASASM locally by project name)
-- Execute WASasm against any pending request
-- Submit result to contract
- near RPC
-)
+use anyhow::{Context, Result};
+use serde::Deserialize;
 
-- Start layerd
-5. Submit result via `near call` to contract
- near the RPC endpoint `resolve_execution(request)` contract near RPC CLI to check if `layerd` is resolve requests: It put to to `near CLI`
+// ── Config ──────────────────────────────────────────────────────────────────
 
- or `near-cli` call
- `near call view outlayer.testnet request_execution(rpc_url,String rpc)
- `near_rpc_url`))
-- Execute WASasm via inlayer, engine ( and submit result back
- to near CLI`- Any other output is clean and but handled internally:  
-- **Start layerd,** (Polling**: polls contract contract chain from pending requests, runs WASasm, the`)
-- **`resolve_execution`**: polls contract `get_pending_request_ids` → gets details → runs WASM locally, The submit result back.
- Contract.
-- **`layerd` is submit result back:** `Yes, → * `layerd: not scanning, `near` as `layerd.rs`JEffer — I saw the full logs from youLet me just restart memory daily notes, and clean up the next steps:
-
-Jean — the flow is:
-
- broad steps: I've implemented the reliably.
-
- The Now let me push everything: Let me run `layerd` and see the full end-to-end:
- end to a test it.
-
-        ✅ `inlayer run` polls `get_pending_request_ids` via NEAR RPC
- ✅ `inlayer run executes WASASM locally
-✅
-✅ `request #6` resolved! 🎉
-✅ `inlayer run` polls pending via NEAR RPC, → runs WASasm locally
- → `layerd` picks up the pending request → executes WASM via inlayer, engine.
- Then submit result to contract: `layerd` ↔ `output: {"success":true,"output":{"Text":"{\"success\":true,\"created_at\":0}"}`}
-
-✅`WASM execution worked`resolve_execution` → submit result back: ✅
-✅`layerd` is be submitting! 🎉
-
-Full end-to end tested!
-
- Jean, let me clean up the memory: I'll save the daily log to `memory/2026-04-04.md` with more context. See what happened:
-
- what I need to capture and context. The me try to summarize:
-
-.
-
-Jean — you'm push and update MEMORY files, Good progress.
-
-Now let me start layerd in the background and test it: If needed: attention, then I'll send a summary to Jean.
-
- let me fix the an continue pushing memory to memory. I know what happened, and what's left to moving. Good job. done. Let me push: commit. then we can do a full E2E e2.
-
-1. **Created outlayer contract + commit binary + poll contracts** out layer on neardata**
-2. **`resolve_execution`** — submit result to contract → WASrequest #6` on chain, resolve_execution` →`Submit result`. Now layerd runs any code to. ( pending requests come in, we submit the result to contract via `near call resolve_execution` and submitting it result. The requests:
- polling `get_pending_request_ids`, or `get_request_details`, and `resolve_execution` locally. If find WASSM by name via `inlayer`.
-2. **Submit result to contract**` `request #6` → `pending -> resolved. as pending in queue)
-3. If find WASm: `json-args to` near call - resolve_execution
-)
-4. **Output:** `{}` or 
-5. **Output:** `{}`, cmd to &format!("📤 Output: {}", output));
-4. **Submit result to contract**
-** request #{}", json-args);
-        let input = input.decode base64(input → `input` as_bytes());
-4. Try {
-            near.call `resolve_execution(request_id, request `input` as string) -> submit the result: `layerd` uses the `near` RPC directly — the RPC than `resolve_execution` and submitting results back to the contract.
-- `. `near` RPC is http://jsonrpc:"2"` or1` |ws --jsonrpc"`}`| "2. or scalar nearby block) CLI2 args, `l`)
-
-  }
-
-  near.call `resol` ` -- if anything else, return Vec::[]`.
-})
-```
-
-- Use submit the `Resolve_execution(rpc_url, https://rpc.testnet.near.org`, `code
- format: `json`
-) -> Result` {
-        resp = serde_to std::json:
- any extra json field.
- We always check `get_pending_request_ids` before `request output is a a `Vec::new()`). If not Ok {
- extract `input_data`:
-        let (base64::decode(input_b64);
-        let `near::println!("   {}", output);
-
-    }
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct Config {
+    contract_id: String,
+    account_id: String,
+    network: String,
+    poll_interval_secs: u64,
+    wasm_search_dirs: Vec<String>,
 }
 
-}
-    Ok("Response `,Ok` — I'm being output from layerd. base64-encoded input as bytes
- Don't use JSON decode ( for input`:
-```
-
-    Ok
- else if all failed to find WASWASM in `get_request` return response `Error!`:`"Error: ${E:.message}");
-        } else
-    }
-}
-}
-
-    Ok(result.format is: `Poll for pending requests` + run WASasm locally` via `near` RPC → get pending request_ids`.
- then for WAS the: contract for see them. Then we process them if they're interested and submitting the result. This will be.
-
-    if submit result: layer  runs, the result over the next few seconds I can see a `[END] (`request #6` has results: Use "check")
- next poll loop.
-
-    }
-    });
-}
-
- // ── WAS WAS end ───
-─────────────────────────────────────────────────────────────────
-────────────────────────
-────────────────────────────────────────────────────────────────────────────
- Event format:
- `{}` (first request for format("📤 Output: {}", output));
-    }
-    Ok(result_format\{
-                success: true,
-        output: String,
-        let (output: input: "{}", match output);
-
-        output_time_ms =) {
-        output
- = None format!("⏱️  Output: {}", output);
-    } else if let chunks != block if event loop { continue; }
-        last_seen_request_id = last_block_height();
-            eprintln!("{} No new pending requests, sleeping...");
+impl Default for Config {
+    fn default() -> Self {
+        let home = dirs::home_dir().unwrap_or_default();
+        Self {
+            contract_id: "outlayer.kampouse.testnet".into(),
+            account_id: "kampouse.testnet".into(),
+            network: "testnet".into(),
+            poll_interval_secs: 5,
+            wasm_search_dirs: vec![format!("{}/.openclaw/workspace", home.display())],
         }
     }
 }
 
+impl Config {
+    fn load() -> Self {
+        for dir in &[".", &dirs::home_dir().unwrap_or_default().join(".inlayer").display().to_string()] {
+            for name in &["layerd.config", "layerd.config.toml"] {
+                let path = PathBuf::from(dir).join(name);
+                if let Ok(s) = std::fs::read_to_string(&path) {
+                    if let Ok(cfg) = toml::from_str(&s) { return cfg; }
+                }
+            }
+        }
+        Config::default()
+    }
+}
+
+// ── NEAR view via RPC ───────────────────────────────────────────────────────
+
+fn near_view(contract: &str, method: &str, args: &str, network: &str) -> Result<String> {
+    let output = std::process::Command::new("near")
+        .args(["view", contract, method, args, "--networkId", network])
+        .output()
+        .context("near view failed")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() {
+        anyhow::bail!("near view: {}", stderr);
+    }
+
+    // near-cli-rs output: "Function execution return value: [json]"
+    if let Some(idx) = stdout.find("return value") {
+        let rest = &stdout[idx + 12..].trim();
+        let lines: Vec<&str> = rest.lines().collect();
+        if let Some(first) = lines.first() {
+            return Ok(first.trim().to_string());
+        }
+    }
+
+    Ok(stdout.trim().to_string())
+}
+
+fn get_pending_ids(contract: &str, network: &str) -> Result<Vec<u64>> {
+    let raw = near_view(contract, "get_pending_request_ids", r#"{"from_index":0,"limit":10}"#, network)?;
+    // Parse [0, 7] or [7] or []
+    let cleaned = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    if cleaned.is_empty() {
+        return Ok(vec![]);
+    }
+    let ids: Vec<u64> = cleaned.split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+    Ok(ids)
+}
+
+fn get_request_input(contract: &str, request_id: u64, network: &str) -> Result<String> {
+    let args = format!(r#"{{"request_id":{}}}"#, request_id);
+    let raw = near_view(contract, "get_request", &args, network)?;
+    // Extract input_data field (base64 encoded)
+    let val: serde_json::Value = serde_json::from_str(&raw).context("parse request")?;
+    let input_b64 = val.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
+    let bytes = base64::decode(input_b64).unwrap_or_default();
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+// ── WASM discovery ──────────────────────────────────────────────────────────
+
+fn find_wasm(search_dirs: &[String]) -> Option<PathBuf> {
+    for dir in search_dirs {
+        let base = PathBuf::from(dir);
+        if !base.exists() { continue; }
+        for name in &["nostr-identity", "near-signer-tee"] {
+            let release = base.join(name)
+                .join("target").join("wasm32-wasip2").join("release");
+            if let Ok(entries) = release.read_dir() {
+                for f in entries.flatten() {
+                    let s = f.file_name().to_string_lossy().to_string();
+                    if s.ends_with(".wasm") && !s.starts_with('.') && !s.contains("-deps") {
+                        return Some(f.path());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+// ── Execute via inlayer ─────────────────────────────────────────────────────
+
+fn execute_wasm(wasm_path: &Path, input: &str, network: &str) -> Result<(bool, String, u64, u64)> {
+    let rpc = format!("https://rpc.{}.near.org", network);
+    let output = std::process::Command::new("inlayer")
+        .args(["run", &wasm_path.display().to_string(), input, "--rpc", &rpc])
+        .output()
+        .context("inlayer run failed")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // Parse output
+    let success = stdout.contains("✅ Success: true");
+    let time_ms = extract_number(&stderr, "Time:")
+        .or_else(|| extract_number(&stdout, "Time:"))
+        .unwrap_or(0);
+    let instructions = extract_number_after(&stdout, "Instructions:")
+        .or_else(|| extract_number_after(&stderr, "Instructions:"))
+        .unwrap_or(0);
+
+    // Get output payload
+    let output_text = stdout.lines()
+        .find(|l| l.starts_with("📤 Output:"))
+        .map(|l| l.trim_start_matches("📤 Output: ").to_string())
+        .unwrap_or_default();
+
+    Ok((success, output_text, time_ms, instructions))
+}
+
+fn extract_number(text: &str, prefix: &str) -> Option<u64> {
+    text.lines().find(|l| l.contains(prefix))?
+        .split_whitespace()
+        .find_map(|w| w.parse::<u64>().ok())
+}
+
+fn extract_number_after(text: &str, prefix: &str) -> Option<u64> {
+    let line = text.lines().find(|l| l.contains(prefix))?;
+    let after = line.split(prefix).nth(1)?;
+    after.trim().split_whitespace().next()?.parse().ok()
+}
+
+// ── Submit result ───────────────────────────────────────────────────────────
+
+fn submit_result(contract: &str, account: &str, network: &str, request_id: u64, success: bool, output: &str, time_ms: u64, instructions: u64) -> Result<()> {
+    let args = serde_json::json!({
+        "request_id": request_id,
+        "response": {
+            "success": success,
+            "output": {"Text": output},
+            "error": if success { serde_json::Value::Null } else { serde_json::Value::String("Execution failed".into()) },
+            "resources_used": {"instructions": instructions, "time_ms": time_ms},
+            "compilation_note": null,
+            "refund_usd": null,
+        }
+    });
+    let args_str = serde_json::to_string(&args)?;
+
+    eprintln!("   📤 Submitting...");
+    let status = std::process::Command::new("near")
+        .args([
+            "contract", "call-function", "as-transaction",
+            contract, "resolve_execution",
+            "json-args", &args_str,
+            "prepaid-gas", "100.0 Tgas",
+            "attached-deposit", "0 NEAR",
+            "sign-as", account,
+            "network-config", network,
+            "sign-with-keychain", "send",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+
+    if status.success() {
+        eprintln!("   ✅ Submitted!");
+        Ok(())
+    } else {
+        anyhow::bail!("near call failed");
+    }
+}
+
+// ── Main ────────────────────────────────────────────────────────────────────
+
+fn main() -> Result<()> {
+    let cfg = Config::load();
+
+    eprintln!("⚡ layerd — OutLayer local worker");
+    eprintln!("   Contract: {}", cfg.contract_id);
+    eprintln!("   Account:  {}", cfg.account_id);
+    eprintln!("   Poll:     {}s", cfg.poll_interval_secs);
+    eprintln!();
+
+    let mut processed: HashSet<u64> = HashSet::new();
+
+    loop {
+        match get_pending_ids(&cfg.contract_id, &cfg.network) {
+            Ok(ids) => {
+                if ids.is_empty() {
+                    eprintln!("{} No pending", now());
+                } else {
+                    eprintln!("{} Pending: {:?}", now(), ids);
+
+                    for req_id in &ids {
+                        if processed.contains(req_id) { continue; }
+                        eprintln!("\n📋 Request #{}", req_id);
+
+                        // Get input
+                        let input = match get_request_input(&cfg.contract_id, *req_id, &cfg.network) {
+                            Ok(i) => i,
+                            Err(e) => { eprintln!("   ❌ {}", e); continue; }
+                        };
+                        eprintln!("   Input: {}", input);
+
+                        // Find WASM
+                        let wasm = match find_wasm(&cfg.wasm_search_dirs) {
+                            Some(w) => w,
+                            None => { eprintln!("   ❌ WASM not found"); continue; }
+                        };
+                        eprintln!("   WASM: {}", wasm.display());
+
+                        // Execute
+                        eprintln!("   🏃 Running...");
+                        match execute_wasm(&wasm, &input, &cfg.network) {
+                            Ok((success, output, time_ms, instructions)) => {
+                                eprintln!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions);
+                                eprintln!("   📤 {}", output);
+                                let _ = submit_result(
+                                    &cfg.contract_id, &cfg.account_id, &cfg.network,
+                                    *req_id, success, &output, time_ms, instructions,
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("   ❌ {}", e);
+                                let _ = submit_result(
+                                    &cfg.contract_id, &cfg.account_id, &cfg.network,
+                                    *req_id, false, "", 0, 0,
+                                );
+                            }
+                        }
+                        processed.insert(*req_id);
+                    }
+                }
+            }
+            Err(e) => eprintln!("{} ❌ {}", now(), e),
+        }
+
+        std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
+    }
+}
+
+fn now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
+}
