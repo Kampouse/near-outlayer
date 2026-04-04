@@ -246,6 +246,10 @@ fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option
 }
 
 /// Get env var with fallback, checking config env first
+fn env_or(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
 fn cfg_env(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -254,8 +258,8 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
     use base64::Engine;
 
     if extra_args.is_empty() || extra_args[0] == "--help" {
-        eprintln!("Usage: inlayer submit <input_json> [--contract <id>] [--account <id>] [--network <net>]");
-        eprintln!("       inlayer submit <input_json> --wasm-url <url> --deposit <near>");
+        eprintln!("Usage: inlayer submit <input_json> [--contract <id>] [--account <id>] [--network <net>] [--wasm-url <url>]");
+        eprintln!("       Env: INLAYER_CONTRACT, INLAYER_ACCOUNT, INLAYER_NETWORK, INLAYER_WASM_URL, INLAYER_DEPOSIT");
         eprintln!();
         eprintln!("Submits an execution request to the OutLayer contract.");
         eprintln!("layerd will pick it up and execute it.");
@@ -264,23 +268,37 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
 
     // Parse args
     let mut input = extra_args[0].clone();
-    let mut contract_id = "outlayer.kampouse.testnet".to_string();
-    let mut account_id = "kampouse.testnet".to_string();
-    let mut network = "testnet".to_string();
-    let mut wasm_url = "https://example.com/test.wasm".to_string();
-    let mut deposit_str = "0.01".to_string();
+    let mut contract_id: Option<String> = std::env::var("INLAYER_CONTRACT").ok();
+    let mut account_id: Option<String> = std::env::var("INLAYER_ACCOUNT").ok();
+    let mut network: Option<String> = std::env::var("INLAYER_NETWORK").ok();
+    let mut wasm_url: Option<String> = std::env::var("INLAYER_WASM_URL").ok();
+    let mut deposit_str = env_or("INLAYER_DEPOSIT", "0.01");
 
     let mut i = 1;
     while i < extra_args.len() {
         match extra_args[i].as_str() {
-            "--contract" if i + 1 < extra_args.len() => { contract_id = extra_args[i + 1].clone(); i += 2; }
-            "--account" if i + 1 < extra_args.len() => { account_id = extra_args[i + 1].clone(); i += 2; }
-            "--network" if i + 1 < extra_args.len() => { network = extra_args[i + 1].clone(); i += 2; }
-            "--wasm-url" if i + 1 < extra_args.len() => { wasm_url = extra_args[i + 1].clone(); i += 2; }
+            "--contract" if i + 1 < extra_args.len() => { contract_id = Some(extra_args[i + 1].clone()); i += 2; }
+            "--account" if i + 1 < extra_args.len() => { account_id = Some(extra_args[i + 1].clone()); i += 2; }
+            "--network" if i + 1 < extra_args.len() => { network = Some(extra_args[i + 1].clone()); i += 2; }
+            "--wasm-url" if i + 1 < extra_args.len() => { wasm_url = Some(extra_args[i + 1].clone()); i += 2; }
             "--deposit" if i + 1 < extra_args.len() => { deposit_str = extra_args[i + 1].clone(); i += 2; }
             other => { input = other.to_string(); i += 1; }
         }
     }
+
+    let contract_id = contract_id.unwrap_or_else(|| {
+        eprintln!("Error: --contract or INLAYER_CONTRACT required");
+        std::process::exit(1);
+    });
+    let account_id = account_id.unwrap_or_else(|| {
+        eprintln!("Error: --account or INLAYER_ACCOUNT required");
+        std::process::exit(1);
+    });
+    let network = network.unwrap_or_else(|| "testnet".to_string());
+    let wasm_url = wasm_url.unwrap_or_else(|| {
+        eprintln!("Error: --wasm-url or INLAYER_WASM_URL required");
+        std::process::exit(1);
+    });
 
     let rpc_url = match network.as_str() {
         "mainnet" => "https://rpc.mainnet.near.org".to_string(),
@@ -392,17 +410,23 @@ fn find_signer(account_id: &str, network: &str) -> Result<InMemorySigner> {
 fn cmd_status(extra_args: &[String]) -> Result<()> {
     use base64::Engine;
 
-    let mut contract_id = "outlayer.kampouse.testnet".to_string();
-    let mut network = "testnet".to_string();
+    let mut contract_id: Option<String> = std::env::var("INLAYER_CONTRACT").ok();
+    let mut network: Option<String> = std::env::var("INLAYER_NETWORK").ok();
 
     let mut i = 0;
     while i < extra_args.len() {
         match extra_args[i].as_str() {
-            "--contract" if i + 1 < extra_args.len() => { contract_id = extra_args[i + 1].clone(); i += 2; }
-            "--network" if i + 1 < extra_args.len() => { network = extra_args[i + 1].clone(); i += 2; }
+            "--contract" if i + 1 < extra_args.len() => { contract_id = Some(extra_args[i + 1].clone()); i += 2; }
+            "--network" if i + 1 < extra_args.len() => { network = Some(extra_args[i + 1].clone()); i += 2; }
             _ => { i += 1; }
         }
     }
+
+    let contract_id = contract_id.unwrap_or_else(|| {
+        eprintln!("Error: --contract or INLAYER_CONTRACT required");
+        std::process::exit(1);
+    });
+    let network = network.unwrap_or_else(|| "testnet".to_string());
 
     let rpc_url = match network.as_str() {
         "mainnet" => "https://rpc.mainnet.near.org".to_string(),
