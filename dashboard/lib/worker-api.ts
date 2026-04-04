@@ -1,4 +1,4 @@
-const API_URL = process.env.NEXT_PUBLIC_WORKER_API_URL || 'http://127.0.0.1:8082';
+const API_URL = process.env.NEXT_PUBLIC_WORKER_API_URL || '/worker-api';
 
 export interface DaemonStatus {
   running: boolean;
@@ -35,29 +35,30 @@ export interface ContractState {
 }
 
 export async function fetchStatus(): Promise<DaemonStatus> {
-  const res = await fetch(`${API_URL}/api/status`);
+  const res = await fetch(`${API_URL}/status`);
   if (!res.ok) throw new Error('Failed to fetch status');
   return res.json();
 }
 
 export async function fetchHistory(): Promise<ExecutionRecord[]> {
-  const res = await fetch(`${API_URL}/api/history`);
+  const res = await fetch(`${API_URL}/history`);
   if (!res.ok) throw new Error('Failed to fetch history');
   return res.json();
 }
 
 export async function fetchStorage(): Promise<StorageEntry[]> {
-  const res = await fetch(`${API_URL}/api/storage`);
+  const res = await fetch(`${API_URL}/storage`);
   if (!res.ok) throw new Error('Failed to fetch storage');
   return res.json();
 }
 
 export async function fetchContract(): Promise<ContractState> {
-  const res = await fetch(`${API_URL}/api/contract`);
+  const res = await fetch(`${API_URL}/contract`);
   if (!res.ok) throw new Error('Failed to fetch contract');
   return res.json();
 }
 
 export function streamUrl(): string {
-  return `${API_URL}/api/stream`;
+  // SSE doesn't work through Next.js rewrites, use direct connection
+  return `${process.env.NEXT_PUBLIC_WORKER_API_URL || 'http://127.0.0.1:8082/api'}/stream`;
 }
