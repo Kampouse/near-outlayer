@@ -21,7 +21,7 @@ use near_primitives::views::QueryRequest;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 struct Config {
     rpc: RpcConfig,
@@ -49,17 +49,6 @@ struct RunnerConfig {
     default_input: Option<String>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            rpc: RpcConfig::default(),
-            storage: StorageConfigSection::default(),
-            runner: RunnerConfig::default(),
-            env: HashMap::new(),
-            search_paths: Vec::new(),
-        }
-    }
-}
 impl Default for RpcConfig {
     fn default() -> Self { Self { url: "https://rpc.testnet.near.org".into() } }
 }
@@ -396,7 +385,7 @@ fn find_signer(account_id: &str, network: &str) -> Result<InMemorySigner> {
     let kf: serde_json::Value = serde_json::from_str(&data)?;
     let private_key = kf["private_key"].as_str().unwrap_or("");
     let secret = if private_key.contains(':') {
-        private_key.split(':').last().unwrap().to_string()
+        private_key.rsplit(':').next_back().unwrap_or_default().to_string()
     } else {
         private_key.to_string()
     };
