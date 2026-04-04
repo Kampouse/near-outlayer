@@ -1,4 +1,7 @@
 use std::collections::HashSet;
+use std::env;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -27,6 +30,8 @@ struct Config {
     poll_interval_secs: u64,
     wasm_search_dirs: Vec<String>,
     key_path: String,
+    log_file: Option<String>,
+    pid_file: Option<String>,
 }
 
 impl Default for Config {
@@ -40,6 +45,8 @@ impl Default for Config {
             poll_interval_secs: 5,
             wasm_search_dirs: vec![format!("{}/.openclaw/workspace", home.display())],
             key_path: format!("{}/.near-credentials/testnet/kampouse.testnet.json", home.display()),
+            log_file: None,
+            pid_file: None,
         }
     }
 }
@@ -56,7 +63,57 @@ impl Config {
         }
         Config::default()
     }
+
+    fn pid_file_path(&self) -> PathBuf {
+        self.pid_file.as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = dirs::home_dir().unwrap_or_default();
+                home.join(".inlayer").join("layerd.pid")
+            })
+    }
+
+    fn log_file_path(&self) -> PathBuf {
+        self.log_file.as_ref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let home = dirs::home_dir().unwrap_or_default();
+                home.join(".inlayer").join("layerd.log")
+            })
+    }
 }
+
+// ── Daemon ──────────────────────────────────────────────────────────────────
+
+fn daemonize(log_path: &Path, pid_path: &Path) -> Result<()> {
+    if let Some(parent) = pid_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    match unsafe { libc::fork() } {
+        -1 => anyhow::bail!("fork failed"),
+        0 => {
+            unsafe { libc::setsid() };
+            unsafe { libc::close(0); libc::close(1); libc::close(2); };
+            // Redirect fd 0,1,2 to /dev/null
+            let dn = fs::File::open("/dev/null").ok();
+            let dn_fd = dn.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
+            unsafe {
+                libc::dup(dn_fd); // stdin
+                libc::dup(dn_fd); // stdout
+                libc::dup(dn_fd); // stderr
+            }
+            fs::write(pid_path, std::process::id().to_string()).ok();
+            Ok(())
+        }
+        _ => {
+            std::thread::sleep(Duration::from_millis(200));
+            std::process::exit(0);
+        }
+    }
+}
+
+use std::os::unix::io::AsRawFd;
 
 // ── Key loading ─────────────────────────────────────────────────────────────
 
@@ -121,7 +178,6 @@ impl Rpc {
         let signer_clone = signer.clone();
 
         self.rt.block_on(async {
-            // Get access key for nonce + block hash
             let access_key_query = methods::query::RpcQueryRequest {
                 block_reference: BlockReference::latest(),
                 request: QueryRequest::ViewAccessKey {
@@ -257,18 +313,87 @@ fn extract_num_after(text: &str, prefix: &str) -> Option<u64> {
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
+fn usage() {
+    eprintln!("layerd — OutLayer local worker");
+    eprintln!();
+    eprintln!("Usage: layerd [OPTIONS]");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  --daemon          Run as background daemon");
+    eprintln!("  --foreground      Run in foreground (default)");
+    eprintln!("  --stop            Stop running daemon");
+    eprintln!("  --status          Check daemon status");
+    eprintln!("  --log             Tail the log file");
+    eprintln!("  -h, --help        Show this help");
+}
+
 fn main() -> Result<()> {
+    let args: Vec<String> = env::args().collect();
     let cfg = Config::load();
 
-    eprintln!("⚡ layerd — OutLayer local worker (direct RPC)");
-    eprintln!("   Contract: {}", cfg.contract_id);
-    eprintln!("   Account:  {}", cfg.account_id);
-    eprintln!("   RPC:      {}", cfg.rpc_url);
-    eprintln!("   Poll:     {}s", cfg.poll_interval_secs);
+    // Handle CLI flags
+    let mode = if args.iter().any(|a| a == "--stop") {
+        return stop_daemon(&cfg);
+    } else if args.iter().any(|a| a == "--status") {
+        return check_status(&cfg);
+    } else if args.iter().any(|a| a == "--log") {
+        return tail_log(&cfg);
+    } else if args.iter().any(|a| a == "-h" || a == "--help") {
+        usage();
+        return Ok(());
+    } else if args.iter().any(|a| a == "--daemon") {
+        "daemon"
+    } else {
+        "foreground"
+    };
 
+    if mode == "daemon" {
+        let pid_path = cfg.pid_file_path();
+        let log_path = cfg.log_file_path();
+
+        // Check if already running
+        if is_running(&pid_path) {
+            eprintln!("layerd already running (PID {})", read_pid(&pid_path).unwrap_or_default());
+            std::process::exit(1);
+        }
+
+        eprintln!("⚡ Starting layerd daemon...");
+        eprintln!("   Log: {}", log_path.display());
+        eprintln!("   PID: {}", pid_path.display());
+
+        daemonize(&log_path, &pid_path)?;
+    } else {
+        eprintln!("⚡ layerd — OutLayer local worker (direct RPC)");
+        eprintln!("   Contract: {}", cfg.contract_id);
+        eprintln!("   Account:  {}", cfg.account_id);
+        eprintln!("   RPC:      {}", cfg.rpc_url);
+        eprintln!("   Poll:     {}s", cfg.poll_interval_secs);
+    }
+
+    // ── Worker loop ─────────────────────────────────────────────────────
     let signer = load_signer(&cfg.key_path)?;
-    eprintln!("   Key: {}", signer.public_key);
-    eprintln!();
+    let is_daemon = mode == "daemon";
+    let mut log_file = if is_daemon {
+        let log_path = cfg.log_file_path();
+        if let Some(parent) = log_path.parent() { fs::create_dir_all(parent).ok(); }
+        fs::OpenOptions::new().create(true).append(true).open(&log_path).ok()
+    } else {
+        None
+    };
+
+    let mut log = |msg: &str| {
+        let line = format!("{} {}\n", now(), msg);
+        if is_daemon {
+            if let Some(ref mut f) = log_file {
+                let _ = f.write_all(line.as_bytes());
+            }
+        } else {
+            eprint!("{}", line);
+        }
+    };
+
+    log(&format!("⚡ layerd started — Contract: {} Account: {} RPC: {}",
+        cfg.contract_id, cfg.account_id, cfg.rpc_url));
 
     let rpc = Rpc::new(&cfg.rpc_url)?;
     let mut processed: HashSet<u64> = HashSet::new();
@@ -277,38 +402,38 @@ fn main() -> Result<()> {
         match get_pending_ids(&rpc, &cfg.contract_id) {
             Ok(ids) => {
                 if ids.is_empty() {
-                    eprintln!("{} No pending", now());
+                    log("No pending");
                 } else {
-                    eprintln!("{} Pending: {:?}", now(), ids);
+                    log(&format!("Pending: {:?}", ids));
 
                     for req_id in &ids {
                         if processed.contains(req_id) { continue; }
-                        eprintln!("\n📋 Request #{}", req_id);
+                        log(&format!("📋 Request #{}", req_id));
 
                         let input = match get_request_input(&rpc, &cfg.contract_id, *req_id) {
                             Ok(i) => i,
-                            Err(e) => { eprintln!("   ❌ {}", e); continue; }
+                            Err(e) => { log(&format!("   ❌ {}", e)); continue; }
                         };
-                        eprintln!("   Input: {}", input);
+                        log(&format!("   Input: {}", input));
 
                         let wasm = match find_wasm(&cfg.wasm_search_dirs) {
                             Some(w) => w,
-                            None => { eprintln!("   ❌ WASM not found"); continue; }
+                            None => { log("   ❌ WASM not found"); continue; }
                         };
-                        eprintln!("   WASM: {}", wasm.display());
+                        log(&format!("   WASM: {}", wasm.display()));
 
-                        eprintln!("   🏃 Running...");
+                        log("   🏃 Running...");
                         match execute_wasm(&wasm, &input, &cfg.network) {
                             Ok((success, output, time_ms, instructions)) => {
-                                eprintln!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions);
-                                eprintln!("   📤 {}", output);
+                                log(&format!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions));
+                                log(&format!("   📤 {}", output));
                                 match resolve(&rpc, &signer, &cfg.contract_id, *req_id, success, &output, time_ms, instructions) {
-                                    Ok(tx_hash) => eprintln!("   ✅ Tx: {}", tx_hash),
-                                    Err(e) => eprintln!("   ❌ Submit failed: {}", e),
+                                    Ok(tx_hash) => log(&format!("   ✅ Tx: {}", tx_hash)),
+                                    Err(e) => log(&format!("   ❌ Submit failed: {}", e)),
                                 }
                             }
                             Err(e) => {
-                                eprintln!("   ❌ {}", e);
+                                log(&format!("   ❌ {}", e));
                                 let _ = resolve(&rpc, &signer, &cfg.contract_id, *req_id, false, "", 0, 0);
                             }
                         }
@@ -316,11 +441,87 @@ fn main() -> Result<()> {
                     }
                 }
             }
-            Err(e) => eprintln!("{} ❌ {}", now(), e),
+            Err(e) => log(&format!("❌ {}", e)),
         }
 
         std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
     }
+}
+
+// ── Daemon management ───────────────────────────────────────────────────────
+
+fn is_running(pid_path: &Path) -> bool {
+    if let Ok(pid_str) = fs::read_to_string(pid_path) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            // Send signal 0 to check if process exists
+            unsafe {
+                return libc::kill(pid as i32, 0) == 0;
+            }
+        }
+    }
+    false
+}
+
+fn read_pid(pid_path: &Path) -> Result<u32> {
+    let s = fs::read_to_string(pid_path)?;
+    Ok(s.trim().parse()?)
+}
+
+fn stop_daemon(cfg: &Config) -> Result<()> {
+    let pid_path = cfg.pid_file_path();
+    if !is_running(&pid_path) {
+        eprintln!("layerd not running");
+        return Ok(());
+    }
+    let pid = read_pid(&pid_path)?;
+    eprintln!("Stopping layerd (PID {})...", pid);
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    // Wait for process to exit
+    for _ in 0..10 {
+        if !is_running(&pid_path) {
+            let _ = fs::remove_file(&pid_path);
+            eprintln!("✅ Stopped");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Force kill
+    unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+    let _ = fs::remove_file(&pid_path);
+    eprintln!("✅ Force killed");
+    Ok(())
+}
+
+fn check_status(cfg: &Config) -> Result<()> {
+    let pid_path = cfg.pid_file_path();
+    let log_path = cfg.log_file_path();
+    if is_running(&pid_path) {
+        let pid = read_pid(&pid_path)?;
+        eprintln!("✅ layerd running (PID {})", pid);
+        eprintln!("   Log: {}", log_path.display());
+        eprintln!("   PID: {}", pid_path.display());
+    } else {
+        eprintln!("❌ layerd not running");
+        if pid_path.exists() {
+            eprintln!("   (stale PID file, cleaning up)");
+            let _ = fs::remove_file(&pid_path);
+        }
+    }
+    Ok(())
+}
+
+fn tail_log(cfg: &Config) -> Result<()> {
+    let log_path = cfg.log_file_path();
+    if !log_path.exists() {
+        eprintln!("No log file at {}", log_path.display());
+        return Ok(());
+    }
+    let output = std::process::Command::new("tail")
+        .args(["-20", &log_path.display().to_string()])
+        .status()?;
+    Ok(())
 }
 
 fn now() -> String {

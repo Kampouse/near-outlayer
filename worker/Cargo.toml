@@ -84,6 +84,7 @@ dstack-sdk = "0.1"
 log = "0.4.28"
 toml = "0.8"
 ureq = { version = "2", features = ["json"] }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.10"

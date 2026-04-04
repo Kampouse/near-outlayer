@@ -3763,6 +3763,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hyper 1.8.1",
+ "libc",
  "log",
  "near-crypto",
  "near-jsonrpc-client",
