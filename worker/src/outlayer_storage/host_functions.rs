@@ -48,6 +48,27 @@ impl StorageHostState {
         Self { client, local_dir, local_cache: Mutex::new(HashMap::new()) }
     }
 
+    /// Create local-only storage (no remote coordinator — for inlayer/testing)
+    pub fn local_only() -> Result<Self> {
+        let local_dir = std::env::var("STORAGE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("./storage"));
+        fs::create_dir_all(&local_dir).ok();
+        let config = StorageConfig {
+            coordinator_url: "http://127.0.0.1:1".into(),
+            coordinator_token: "local".into(),
+            keystore_url: "http://127.0.0.1:1".into(),
+            keystore_token: "local".into(),
+            project_uuid: "local-test".into(),
+            wasm_hash: "00000000".into(),
+            account_id: std::env::var("TEE_SIGNER_ID").unwrap_or_else(|_| "test.testnet".into()),
+            tee_mode: "local".into(),
+            keystore_tee_session_id: None,
+        };
+        let client = StorageClient::new(config)?;
+        Ok(Self { client, local_dir, local_cache: Mutex::new(HashMap::new()) })
+    }
+
     fn safe_key(&self, key: &str) -> String {
         hex::encode(key.as_bytes())
     }

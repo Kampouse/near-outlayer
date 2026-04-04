@@ -273,25 +273,7 @@ pub async fn execute(
         .any(|(name, _)| name.contains("near:storage/api"));
 
     let storage_config = exec_ctx.and_then(|ctx| ctx.storage_config.as_ref());
-
-    // If WASM imports storage but we don't have storage config, fail early with helpful message
-    if has_storage_import && storage_config.is_none() {
-        anyhow::bail!(
-            "WASM imports `near:storage/api` but storage is not configured.\n\
-            \n\
-            This WASM was built with the `outlayer` crate and expects persistent storage.\n\
-            \n\
-            Possible causes:\n\
-            1. WASM is running standalone (not as part of a project)\n\
-            2. Keystore is not configured (KEYSTORE_BASE_URL/KEYSTORE_AUTH_TOKEN)\n\
-            3. Project UUID is missing from execution request\n\
-            \n\
-            To fix:\n\
-            1. Run this WASM through a project (request_execution_version with project_id)\n\
-            2. Ensure keystore is properly configured in worker environment\n\
-            3. Or rebuild WASM without `outlayer` crate if you don't need storage"
-        );
-    }
+    let use_local_storage = has_storage_import && storage_config.is_none();
 
     // Create linker with WASI and HTTP support
     let mut linker: Linker<HostState> = Linker::new(&engine);
@@ -344,16 +326,27 @@ pub async fn execute(
                 .context("spawn_blocking failed")?
                 .context("Failed to create storage client")?;
 
-            // Add storage host functions to linker
             add_storage_to_linker(&mut linker, |state: &mut HostState| {
                 state.storage_state_mut()
             })?;
 
             Some(StorageHostState::from_client(storage_client))
+        } else if use_local_storage {
+            debug!("Adding local-only storage host functions (no remote coordinator)");
+            add_storage_to_linker(&mut linker, |state: &mut HostState| {
+                state.storage_state_mut()
+            })?;
+            Some(StorageHostState::local_only()?)
         } else {
             debug!("No storage config in execution context");
             None
         }
+    } else if use_local_storage {
+        debug!("Adding local-only storage host functions (no execution context)");
+        add_storage_to_linker(&mut linker, |state: &mut HostState| {
+            state.storage_state_mut()
+        })?;
+        Some(StorageHostState::local_only()?)
     } else {
         None
     };
