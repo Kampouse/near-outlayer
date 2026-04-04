@@ -2,13 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use near_crypto::{InMemorySigner, Signer};
 use near_jsonrpc_client::{methods, JsonRpcClient};
@@ -23,6 +24,66 @@ use offchainvm_worker::api_client::{ExecutionOutput, ResourceLimits, ResponseFor
 use offchainvm_worker::config::RpcProxyConfig;
 use offchainvm_worker::executor::{ExecutionContext, Executor};
 use offchainvm_worker::outlayer_rpc::RpcProxy;
+
+// Dashboard imports
+use axum::{
+    extract::State,
+    response::sse::{Event, Sse},
+    routing::get,
+    Router,
+};
+use std::sync::Mutex;
+use tokio::sync::broadcast;
+use tokio_stream::StreamExt;
+use tower_http::cors::CorsLayer;
+
+// ── Execution Record (shared state) ─────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct ExecutionRecord {
+    request_id: u64,
+    input: String,
+    output: String,
+    execution_time_ms: u64,
+    instructions: u64,
+    timestamp: String,
+    success: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DaemonStatus {
+    running: bool,
+    uptime_secs: u64,
+    poll_count: u64,
+    last_poll_time: Option<String>,
+    contract_id: String,
+    account_id: String,
+    rpc_url: String,
+    poll_interval_secs: u64,
+    dashboard_addr: Option<String>,
+}
+
+struct DashboardState {
+    history: Mutex<Vec<ExecutionRecord>>,
+    status: Mutex<DashboardStatusInner>,
+    events_tx: broadcast::Sender<String>,
+    storage_dir: PathBuf,
+    contract_id: String,
+    rpc_url: String,
+}
+
+#[derive(Debug)]
+struct DashboardStatusInner {
+    start_time: std::time::Instant,
+    poll_count: u64,
+    last_poll_time: Option<String>,
+    contract_id: String,
+    account_id: String,
+    rpc_url: String,
+    poll_interval_secs: u64,
+    dashboard_addr: Option<String>,
+}
+
 // ── Config ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -39,6 +100,8 @@ struct Config {
     pid_file: Option<String>,
     /// Environment variables to pass to WASM execution
     env: HashMap<String, String>,
+    /// Dashboard HTTP server bind address (e.g. "127.0.0.1:8082")
+    dashboard_addr: Option<String>,
 }
 
 impl Default for Config {
@@ -55,6 +118,7 @@ impl Default for Config {
             log_file: None,
             pid_file: None,
             env: HashMap::new(),
+            dashboard_addr: None,
         }
     }
 }
@@ -134,13 +198,8 @@ struct KeyFile {
 fn load_signer(path: &str) -> Result<InMemorySigner> {
     let data = std::fs::read_to_string(path).context("reading key file")?;
     let kf: KeyFile = serde_json::from_str(&data).context("parsing key file")?;
-    let secret = if kf.private_key.contains(':') {
-        kf.private_key.rsplit(':').next_back().unwrap_or_default().to_string()
-    } else {
-        kf.private_key.clone()
-    };
     let signer_account_id: near_primitives::types::AccountId = kf.account_id.parse()?;
-    let signer_secret_key: near_crypto::SecretKey = secret.parse()?;
+    let signer_secret_key: near_crypto::SecretKey = kf.private_key.parse()?;
     Ok(InMemorySigner::from_secret_key(signer_account_id, signer_secret_key))
 }
 
@@ -362,6 +421,131 @@ fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str, env_vars: &HashMap
     Ok((success, output, time_ms, instructions))
 }
 
+// ── Dashboard HTTP API ──────────────────────────────────────────────────────
+
+async fn api_status(State(state): State<Arc<DashboardState>>) -> axum::Json<DaemonStatus> {
+    let inner = state.status.lock().unwrap();
+    axum::Json(DaemonStatus {
+        running: true,
+        uptime_secs: inner.start_time.elapsed().as_secs(),
+        poll_count: inner.poll_count,
+        last_poll_time: inner.last_poll_time.clone(),
+        contract_id: inner.contract_id.clone(),
+        account_id: inner.account_id.clone(),
+        rpc_url: inner.rpc_url.clone(),
+        poll_interval_secs: inner.poll_interval_secs,
+        dashboard_addr: inner.dashboard_addr.clone(),
+    })
+}
+
+async fn api_history(State(state): State<Arc<DashboardState>>) -> axum::Json<Vec<ExecutionRecord>> {
+    let hist = state.history.lock().unwrap();
+    let mut records: Vec<ExecutionRecord> = hist.iter().rev().take(50).cloned().collect();
+    records.reverse();
+    axum::Json(records)
+}
+
+async fn api_stream(
+    State(state): State<Arc<DashboardState>>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let rx = state.events_tx.subscribe();
+    let stream = tokio_stream::wrappers::BroadcastStream::new(rx);
+    let stream = stream.filter_map(|result| {
+        match result {
+            Ok(msg) => Some(Ok(Event::default().data(msg))),
+            Err(_) => None,
+        }
+    });
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
+}
+
+#[derive(Serialize)]
+struct StorageEntry {
+    name: String,
+    hex_name: String,
+    size: u64,
+}
+
+async fn api_storage(State(state): State<Arc<DashboardState>>) -> axum::Json<Vec<StorageEntry>> {
+    let dir = &state.storage_dir;
+    let mut entries = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let hex_name = e.file_name().to_string_lossy().to_string();
+            let decoded = hex::decode(&hex_name)
+                .ok()
+                .and_then(|b| String::from_utf8(b).ok())
+                .unwrap_or_else(|| hex_name.clone());
+            let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            entries.push(StorageEntry { name: decoded, hex_name, size });
+        }
+    }
+    axum::Json(entries)
+}
+
+#[derive(Serialize)]
+struct ContractState {
+    pending_request_ids: Vec<u64>,
+    pending_count: usize,
+    contract_id: String,
+}
+
+async fn api_contract(State(state): State<Arc<DashboardState>>) -> axum::Json<ContractState> {
+    // Use a blocking call to query the contract
+    let rpc_url = state.rpc_url.clone();
+    let contract_id = state.contract_id.clone();
+    let result = std::thread::spawn(move || -> Result<Vec<u64>> {
+        let rpc = Rpc::new(&rpc_url)?;
+        get_pending_ids(&rpc, &contract_id)
+    }).join().unwrap_or(Ok(vec![]));
+
+    let ids = result.unwrap_or_default();
+    axum::Json(ContractState {
+        pending_count: ids.len(),
+        pending_request_ids: ids,
+        contract_id: state.contract_id.clone(),
+    })
+}
+
+fn spawn_dashboard(addr: &str, state: Arc<DashboardState>) {
+    let addr_str = addr.to_string();
+    let addr: SocketAddr = match addr.parse() {
+        Ok(a) => a,
+        Err(e) => { eprintln!("❌ Invalid dashboard address '{}': {}", addr, e); return; }
+    };
+    let state_clone = state.clone();
+
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => { eprintln!("❌ Dashboard runtime failed: {}", e); return; }
+        };
+        rt.block_on(async move {
+            let app = Router::new()
+                .route("/api/status", get(api_status))
+                .route("/api/history", get(api_history))
+                .route("/api/stream", get(api_stream))
+                .route("/api/storage", get(api_storage))
+                .route("/api/contract", get(api_contract))
+                .layer(CorsLayer::permissive())
+                .with_state(state_clone);
+
+            eprintln!("📊 Dashboard: http://{}", addr_str);
+            let listener = match tokio::net::TcpListener::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => { eprintln!("❌ Dashboard bind failed: {}", e); return; }
+            };
+            if let Err(e) = axum::serve(listener, app).await {
+                eprintln!("❌ Dashboard server error: {}", e);
+            }
+        });
+    });
+}
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn usage() {
@@ -370,18 +554,22 @@ fn usage() {
     eprintln!("Usage: layerd [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --daemon          Run as background daemon");
-    eprintln!("  --foreground      Run in foreground (default)");
-    eprintln!("  --start           Start daemon via launchd");
-    eprintln!("  --stop            Stop daemon (unloads launchd)");
-    eprintln!("  --status          Check daemon status");
-    eprintln!("  --log             Tail the log file");
-    eprintln!("  -h, --help        Show this help");
+    eprintln!("  --daemon            Run as background daemon");
+    eprintln!("  --foreground        Run in foreground (default)");
+    eprintln!("  --dashboard <addr>  Enable dashboard HTTP server (e.g. 127.0.0.1:8082)");
+    eprintln!("  --start             Start daemon via launchd");
+    eprintln!("  --stop              Stop daemon (unloads launchd)");
+    eprintln!("  --status            Check daemon status");
+    eprintln!("  --log               Tail the log file");
+    eprintln!("  -h, --help          Show this help");
 }
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let cfg = Config::load();
+
+    // Parse --dashboard flag from CLI (overrides config)
+    let dashboard_addr = parse_dashboard_flag(&args).or(cfg.dashboard_addr.clone());
 
     // Handle CLI flags
     let mode = if args.iter().any(|a| a == "--stop") {
@@ -429,6 +617,34 @@ fn main() -> Result<()> {
         eprintln!("   Poll:     {}s", cfg.poll_interval_secs);
     }
 
+    // ── Dashboard setup ────────────────────────────────────────────────
+    let (events_tx, _) = broadcast::channel(100);
+    let storage_dir = env::var("STORAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./storage"));
+
+    let dashboard_state = Arc::new(DashboardState {
+        history: Mutex::new(Vec::new()),
+        status: Mutex::new(DashboardStatusInner {
+            start_time: std::time::Instant::now(),
+            poll_count: 0,
+            last_poll_time: None,
+            contract_id: cfg.contract_id.clone(),
+            account_id: cfg.account_id.clone(),
+            rpc_url: cfg.rpc_url.clone(),
+            poll_interval_secs: cfg.poll_interval_secs,
+            dashboard_addr: dashboard_addr.clone(),
+        }),
+        events_tx,
+        storage_dir,
+        contract_id: cfg.contract_id.clone(),
+        rpc_url: cfg.rpc_url.clone(),
+    });
+
+    if let Some(ref addr) = dashboard_addr {
+        spawn_dashboard(addr, dashboard_state.clone());
+    }
+
     // ── Worker loop ─────────────────────────────────────────────────────
     let signer = load_signer(&cfg.key_path)?;
     let is_daemon = mode == "daemon";
@@ -449,6 +665,8 @@ fn main() -> Result<()> {
         } else {
             eprint!("{}", line);
         }
+        // Broadcast to SSE subscribers
+        let _ = dashboard_state.events_tx.send(msg.to_string());
     };
 
     log(&format!("⚡ layerd started — Contract: {} Account: {} RPC: {}",
@@ -464,6 +682,13 @@ fn main() -> Result<()> {
     let mut consecutive_errors = 0u32;
 
     loop {
+        // Update poll count
+        {
+            let mut st = dashboard_state.status.lock().unwrap();
+            st.poll_count += 1;
+            st.last_poll_time = Some(now());
+        }
+
         match get_pending_ids(&rpc, &cfg.contract_id) {
             Ok(ids) => {
                 consecutive_errors = 0;
@@ -493,6 +718,26 @@ fn main() -> Result<()> {
                             Ok((success, output, time_ms, instructions)) => {
                                 log(&format!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions));
                                 log(&format!("   📤 {}", output));
+
+                                // Record execution
+                                let record = ExecutionRecord {
+                                    request_id: *req_id,
+                                    input: req_info.input.clone(),
+                                    output: output.clone(),
+                                    execution_time_ms: time_ms,
+                                    instructions,
+                                    timestamp: now(),
+                                    success,
+                                };
+                                {
+                                    let mut hist = dashboard_state.history.lock().unwrap();
+                                    hist.push(record);
+                                    // Keep last 200
+                                    if hist.len() > 200 {
+                                        let excess = hist.len().saturating_sub(200); hist.drain(0..excess);
+                                    }
+                                }
+
                                 match resolve(&rpc, &signer, &cfg.contract_id, *req_id, success, &output, time_ms, instructions) {
                                     Ok(tx_hash) => log(&format!("   ✅ Tx: {}", tx_hash)),
                                     Err(e) => log(&format!("   ❌ Submit failed: {}", e)),
@@ -500,6 +745,25 @@ fn main() -> Result<()> {
                             }
                             Err(e) => {
                                 log(&format!("   ❌ {}", e));
+
+                                // Record failed execution
+                                let record = ExecutionRecord {
+                                    request_id: *req_id,
+                                    input: req_info.input.clone(),
+                                    output: format!("Error: {}", e),
+                                    execution_time_ms: 0,
+                                    instructions: 0,
+                                    timestamp: now(),
+                                    success: false,
+                                };
+                                {
+                                    let mut hist = dashboard_state.history.lock().unwrap();
+                                    hist.push(record);
+                                    if hist.len() > 200 {
+                                        let excess = hist.len().saturating_sub(200); hist.drain(0..excess);
+                                    }
+                                }
+
                                 let _ = resolve(&rpc, &signer, &cfg.contract_id, *req_id, false, "", 0, 0);
                             }
                         }
@@ -521,6 +785,17 @@ fn main() -> Result<()> {
 
         std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
     }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn parse_dashboard_flag(args: &[String]) -> Option<String> {
+    for i in 0..args.len() {
+        if args[i] == "--dashboard" && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+    }
+    None
 }
 
 // ── Daemon management ───────────────────────────────────────────────────────
