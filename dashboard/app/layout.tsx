@@ -117,6 +117,10 @@ export default function RootLayout({
                       <Link href="/playground" className="text-gray-700 hover:text-[#cc6600] px-3 py-2 rounded-md text-sm font-medium transition-colors">
                         Playground
                       </Link>
+                      <Link href="/worker-dashboard" className="text-gray-700 hover:text-[#cc6600] px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center gap-1">
+                        Worker
+                        <span className="w-1.5 h-1.5 rounded-full bg-green-500 inline-block"></span>
+                      </Link>
                     </div>
                   </div>
 
@@ -216,6 +220,13 @@ export default function RootLayout({
                         className="text-gray-700 hover:text-[#cc6600] px-3 py-2 rounded-md text-sm font-medium transition-colors"
                       >
                         Playground
+                      </Link>
+                      <Link
+                        href="/worker-dashboard"
+                        onClick={() => setMobileMenuOpen(false)}
+                        className="text-gray-700 hover:text-[#cc6600] px-3 py-2 rounded-md text-sm font-medium transition-colors flex items-center gap-1"
+                      >
+                        Worker <span className="w-1.5 h-1.5 rounded-full bg-green-500 inline-block"></span>
                       </Link>
                       <Link
                         href="/workspace"
