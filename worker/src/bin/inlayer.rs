@@ -384,13 +384,8 @@ fn find_signer(account_id: &str, network: &str) -> Result<InMemorySigner> {
         .with_context(|| format!("reading {}", key_path.display()))?;
     let kf: serde_json::Value = serde_json::from_str(&data)?;
     let private_key = kf["private_key"].as_str().unwrap_or("");
-    let secret = if private_key.contains(':') {
-        private_key.rsplit(':').next_back().unwrap_or_default().to_string()
-    } else {
-        private_key.to_string()
-    };
     let account_id: AccountId = account_id.parse()?;
-    let secret_key: SecretKey = secret.parse()?;
+    let secret_key: SecretKey = private_key.parse()?;
     Ok(InMemorySigner::from_secret_key(account_id, secret_key))
 }
 
