@@ -237,14 +237,27 @@ fn get_pending_ids(rpc: &Rpc, contract: &str) -> Result<Vec<u64>> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn get_request_input(rpc: &Rpc, contract: &str, request_id: u64) -> Result<String> {
+struct RequestInfo {
+    input: String,
+    max_instructions: u64,
+    max_memory_mb: u32,
+    max_execution_seconds: u64,
+}
+
+fn get_request_info(rpc: &Rpc, contract: &str, request_id: u64) -> Result<RequestInfo> {
     let args = serde_json::to_vec(&serde_json::json!({"request_id": request_id}))?;
     let bytes = rpc.view(contract, "get_request", &args)?;
     if bytes.is_empty() { anyhow::bail!("request {} not found", request_id); }
     let req: serde_json::Value = serde_json::from_slice(&bytes)?;
     let input_b64 = req.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
     let decoded = base64::engine::general_purpose::STANDARD.decode(input_b64).unwrap_or_default();
-    Ok(String::from_utf8_lossy(&decoded).to_string())
+    let limits = req.get("resource_limits");
+    Ok(RequestInfo {
+        input: String::from_utf8_lossy(&decoded).to_string(),
+        max_instructions: limits.and_then(|l| l.get("max_instructions")).and_then(|v| v.as_u64()).unwrap_or(10_000_000_000),
+        max_memory_mb: limits.and_then(|l| l.get("max_memory_mb")).and_then(|v| v.as_u64()).unwrap_or(256) as u32,
+        max_execution_seconds: limits.and_then(|l| l.get("max_execution_seconds")).and_then(|v| v.as_u64()).unwrap_or(60),
+    })
 }
 
 fn resolve(
@@ -287,7 +300,7 @@ fn find_wasm(search_dirs: &[String]) -> Option<PathBuf> {
     None
 }
 
-fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str, env_vars: &HashMap<String, String>) -> Result<(bool, String, u64, u64)> {
+fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str, env_vars: &HashMap<String, String>, req_limits: &RequestInfo) -> Result<(bool, String, u64, u64)> {
 
     let wasm_bytes = fs::read(wasm_path)
         .with_context(|| format!("reading {}", wasm_path.display()))?;
@@ -297,7 +310,6 @@ fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str, env_vars: &HashMap
         .unwrap_or_else(|_| PathBuf::from("./storage"));
     fs::create_dir_all(&storage_dir).ok();
 
-    // Create RPC proxy
     let rpc_cfg = RpcProxyConfig {
         enabled: true,
         rpc_url: Some(rpc_url.to_string()),
@@ -311,19 +323,19 @@ fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str, env_vars: &HashMap
 
     let exec_ctx = ExecutionContext {
         outlayer_rpc: Some(Arc::new(proxy)),
-        storage_config: None, // local-only fallback via auto-detect
+        storage_config: None,
         runtime_handle: handle,
         compiled_cache: None,
         vrf_config: None,
         wallet_config: None,
     };
 
-    let executor = Executor::new(10_000_000_000, true).with_context(exec_ctx);
+    let executor = Executor::new(req_limits.max_instructions, true).with_context(exec_ctx);
 
     let limits = ResourceLimits {
-        max_instructions: 10_000_000_000,
-        max_memory_mb: 256,
-        max_execution_seconds: 60,
+        max_instructions: req_limits.max_instructions,
+        max_memory_mb: req_limits.max_memory_mb,
+        max_execution_seconds: req_limits.max_execution_seconds,
     };
 
     let env = if env_vars.is_empty() { None } else { Some(env_vars.clone()) };
@@ -344,14 +356,16 @@ fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str, env_vars: &HashMap
         None => String::new(),
     };
 
-    std::mem::forget(rt);
+    // Drop executor first (releases runtime handle), then runtime can drop cleanly
+    drop(executor);
+    drop(rt);
     Ok((success, output, time_ms, instructions))
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn usage() {
-    eprintln!("layerd — OutLayer local worker");
+    eprintln!("layerd v{} — OutLayer local worker", env!("CARGO_PKG_VERSION"));
     eprintln!();
     eprintln!("Usage: layerd [OPTIONS]");
     eprintln!();
@@ -462,11 +476,11 @@ fn main() -> Result<()> {
                         if processed.contains(req_id) { continue; }
                         log(&format!("📋 Request #{}", req_id));
 
-                        let input = match get_request_input(&rpc, &cfg.contract_id, *req_id) {
+                        let req_info = match get_request_info(&rpc, &cfg.contract_id, *req_id) {
                             Ok(i) => i,
                             Err(e) => { log(&format!("   ❌ {}", e)); continue; }
                         };
-                        log(&format!("   Input: {}", input));
+                        log(&format!("   Input: {}", req_info.input));
 
                         let wasm = match find_wasm(&cfg.wasm_search_dirs) {
                             Some(w) => w,
@@ -475,7 +489,7 @@ fn main() -> Result<()> {
                         log(&format!("   WASM: {}", wasm.display()));
 
                         log("   🏃 Running...");
-                        match execute_wasm(&wasm, &input, &cfg.rpc_url, &cfg.env) {
+                        match execute_wasm(&wasm, &req_info.input, &cfg.rpc_url, &cfg.env, &req_info) {
                             Ok((success, output, time_ms, instructions)) => {
                                 log(&format!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions));
                                 log(&format!("   📤 {}", output));

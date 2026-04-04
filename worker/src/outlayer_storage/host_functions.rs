@@ -131,22 +131,19 @@ impl near::storage::api::Host for StorageHostState {
     fn list_keys(&mut self, prefix: String) -> (String, String) {
         debug!("storage::list_keys prefix={}", prefix);
         if self.client.is_local() {
-            // Scan local filesystem for keys matching prefix
             let keys: Vec<String> = fs::read_dir(&self.local_dir)
                 .ok()
                 .map(|entries| {
                     entries.filter_map(|e| e.ok())
                         .filter_map(|e| {
-                            let hex = e.file_name().to_string_lossy().to_string();
-                            let key = hex.bytes()
-                                .collect::<Vec<_>>()
-                                .chunks(2)
-                                .filter_map(|c| {
-                                    if c.len() == 2 {
-                                        let s = format!("{}{}", c[0] as char, c[1] as char);
-                                        u8::from_str_radix(&s, 16).ok().map(|b| b as char)
-                                    } else { None }
+                            let hex_str = e.file_name().to_string_lossy().to_string();
+                            // Decode hex filename back to original key string
+                            let key = (0..hex_str.len())
+                                .step_by(2)
+                                .filter_map(|i| {
+                                    u8::from_str_radix(&hex_str[i..i+2.min(hex_str.len()-i)], 16).ok()
                                 })
+                                .map(|b| b as char)
                                 .collect::<String>();
                             if key.starts_with(&prefix) { Some(format!("\"{}\"", key)) } else { None }
                         })

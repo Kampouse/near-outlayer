@@ -250,7 +250,9 @@ fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option
     }
     if let Some(error) = &result.error { println!("❌ Error: {}", error); }
 
-    std::mem::forget(rt); // Leak runtime to avoid "Cannot drop runtime" panic (CLI tool, negligible)
+    // Drop executor first (releases runtime handle), then runtime drops cleanly
+    drop(executor);
+    drop(rt);
     Ok(())
 }
 
@@ -358,12 +360,20 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
         let signed_tx = Transaction::V0(transaction).sign(&near_crypto::Signer::InMemory(signer));
         let tx_hash = signed_tx.get_hash();
 
-        client
-            .call(near_jsonrpc_client::methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
+        let result = client
+            .call(near_jsonrpc_client::methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
                 signed_transaction: signed_tx,
             })
             .await
             .context("broadcast tx failed")?;
+
+        match &result.status {
+            near_primitives::views::FinalExecutionStatus::Failure(e) => {
+                anyhow::bail!("Transaction failed: {:?}", e);
+            }
+            near_primitives::views::FinalExecutionStatus::SuccessValue(_) => {}
+            _ => {}
+        }
 
         eprintln!("✅ Submitted! tx: {}", tx_hash);
         eprintln!("   layerd will pick it up automatically.");
@@ -546,14 +556,20 @@ fn main() -> Result<()> {
     };
 
     if args.len() < 2 || args[1] == "-h" || args[1] == "--help" || args[1] == "help" {
-        eprintln!("inlayer — OutLayer local WASM runner + request submission\n\n\
+        eprintln!("inlayer v{} — OutLayer local WASM runner + request submission\n\n\
 Usage:\n\
   inlayer run <wasm> <input> [--rpc <url>]    Run WASM locally\n\
-  inlayer submit <input> [--contract <id>]    Submit request to contract\n\
+  inlayer submit <input> [--wasm-url <url>]   Submit request to contract\n\
   inlayer status [--contract <id>]            Check pending requests\n\
   inlayer list                                List available WASMs\n\
-  inlayer config                              Show current config\n\n\
-Config: ./inlayer.config or ~/.inlayer/inlayer.config");
+  inlayer config                              Show current config\n\
+  inlayer version                             Show version\n\n\
+Config: ./inlayer.config or ~/.inlayer/inlayer.config", env!("CARGO_PKG_VERSION"));
+        std::process::exit(0);
+    }
+
+    if args[1] == "version" || args[1] == "-v" || args[1] == "--version" {
+        eprintln!("inlayer {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
 
