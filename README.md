@@ -106,27 +106,121 @@ cd dashboard && npm install && npm run dev
 
 See [QUICK_START.md](QUICK_START.md) for full setup instructions including database initialization and Docker services.
 
-## InLayer — Local WASM Runner
+## InLayer — Local WASM Runner & CLI
 
-InLayer is a CLI tool for running WASI/WASM components locally without the full OutLayer stack. It uses the real worker execution engine with local filesystem storage — perfect for development and testing.
+InLayer is a CLI tool for running WASI/WASM components locally and submitting execution requests on-chain. It uses the real worker execution engine with local filesystem storage — perfect for development and testing.
+
+### Build & Install
 
 ```bash
-# Build & install
-cd worker && cargo install --bin inlayer --path .
-
-# Run any WASI Preview 2 WASM
-inlayer run nostr-identity '{"action":"stats"}'
-inlayer run my-component --rpc https://rpc.mainnet.near.org
-inlayer list    # discover WASMs in your workspace
+cd worker
+cargo build --release --bin inlayer --bin layerd
+cp target/release/inlayer ~/.local/bin/
+cp target/release/layerd ~/.inlayer/bin/
 ```
 
-Features:
-- **Real NEAR RPC** — `view`/`call` hit actual RPC endpoints
-- **Local storage** — filesystem fallback, no keystore needed
-- **Config via TOML** — `~/.inlayer/config.local.toml` or `./config.local.toml`
-- **Workspace discovery** — auto-finds WASMs in sibling project directories
+### Configuration
 
-See `worker/src/bin/inlayer.rs` for source.
+InLayer uses environment variables (no hardcoded accounts). Set them in your shell:
+
+```bash
+# Required
+export INLAYER_CONTRACT="your-contract.testnet"    # OutLayer contract ID
+export INLAYER_ACCOUNT="your-account.testnet"       # NEAR signer account
+export INLAYER_WASM_URL="https://..."               # WASM binary URL
+
+# Optional
+export INLAYER_NETWORK="testnet"                    # default: testnet
+export INLAYER_DEPOSIT="0.01"                       # NEAR deposit, default: 0.01
+```
+
+Or pass via CLI flags: `--contract`, `--account`, `--network`, `--wasm-url`
+
+Config file: `~/.inlayer/inlayer.config` (searches `./`, `~/.inlayer/`)
+
+```toml
+search_paths = ["~/projects"]
+
+[rpc]
+url = "https://test.rpc.fastnear.com"
+
+[runner]
+default_input = '{"action":"stats"}'
+
+[env]
+INLAYER_CONTRACT = "your-contract.testnet"
+INLAYER_ACCOUNT = "your-account.testnet"
+INLAYER_WASM_URL = "https://..."
+INLAYER_NETWORK = "testnet"
+```
+
+### Commands
+
+```bash
+# Run WASM locally (no blockchain needed)
+inlayer run ./my-component.wasm '{"action":"stats"}' --rpc https://test.rpc.fastnear.com
+
+# Submit execution request on-chain (layerd picks it up)
+inlayer submit '{"action":"stats"}'
+
+# Check pending requests
+inlayer status
+
+# List discoverable WASMs
+inlayer list
+
+# Version
+inlayer version
+```
+
+### layerd — Autonomous Daemon
+
+```bash
+# Start/stop via launchd (macOS)
+layerd --start
+layerd --stop
+layerd --status
+layerd --log
+
+# Config: ~/.inlayer/layerd.config
+# Log: ~/.inlayer/layerd.log
+```
+
+layerd polls the OutLayer contract for pending requests, executes WASM locally, and submits results on-chain. No `near` CLI dependency — uses JSON-RPC directly.
+
+### E2E Example (nostr-identity)
+
+```bash
+# 1. Local test
+inlayer run nostr-identity-zkp-tee.wasm '{"action":"stats"}' --rpc https://test.rpc.fastnear.com
+# → {"success":true,"created_at":0}
+
+# 2. Write identity data to local storage
+echo -n '{"npub":"test","commitment":"abc","created_at":1712246400}' \
+  > "./storage/$(echo -n 'npub:test' | xxd -p -c 100)"
+
+# 3. Verify
+inlayer run nostr-identity-zkp-tee.wasm '{"action":"check_commitment","commitment":"abc"}' --rpc https://test.rpc.fastnear.com
+# → {"success":true,"verified":true}
+
+# 4. Submit on-chain
+inlayer submit '{"action":"stats"}'
+# → ✅ Submitted! tx: ...
+
+# 5. Check status
+inlayer status
+# → ✅ No pending requests (layerd resolved it)
+```
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `~/.near-credentials/{network}/{account}.json` | NEAR signer key |
+| `~/.inlayer/inlayer.config` | Config (search paths, RPC, env vars) |
+| `~/.inlayer/layerd.config` | Daemon config (RPC URL, poll interval) |
+| `~/.inlayer/layerd.log` | Daemon log |
+| `./storage/` | Local filesystem storage (hex-encoded keys) |
 
 ## Documentation
 
