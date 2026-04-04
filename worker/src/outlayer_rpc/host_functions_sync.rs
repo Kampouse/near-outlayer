@@ -31,7 +31,7 @@ wasmtime::component::bindgen!({
     world: "rpc-host",
 });
 
-/// RPC Proxy client with rate limiting (using blocking HTTP)
+/// RPC Proxy client with rate limiting (uses async-compatible blocking HTTP)
 pub struct RpcProxy {
     /// HTTP client for RPC requests (blocking)
     client: reqwest::blocking::Client,

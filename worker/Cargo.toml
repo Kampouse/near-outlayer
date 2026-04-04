@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "offchainvm-worker"
 path = "src/main.rs"
 
+[[bin]]
+name = "inlayer"
+path = "src/bin/inlayer.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }
@@ -78,6 +82,7 @@ dirs = "5.0"
 # Phala dstack SDK for TDX attestation
 dstack-sdk = "0.1"
 log = "0.4.28"
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -26,6 +26,7 @@ near-outlayer/
 ├── keystore-dao-contract/ # DAO governance for keystore worker registration
 ├── coordinator/           # Task queue & API server (Rust + Axum, PostgreSQL + Redis)
 ├── worker/                # Execution workers (Rust + Tokio, wasmi runtime)
+│   └── src/bin/inlayer.rs # InLayer — local WASM runner CLI
 ├── keystore-worker/       # Secrets decryption service (Rust, runs in TEE)
 ├── dashboard/             # Web UI + documentation (Next.js + React)
 ├── sdk/                   # OutLayer SDK for WASI apps (Rust, wasm32-wasip2)
@@ -104,6 +105,28 @@ cd dashboard && npm install && npm run dev
 ```
 
 See [QUICK_START.md](QUICK_START.md) for full setup instructions including database initialization and Docker services.
+
+## InLayer — Local WASM Runner
+
+InLayer is a CLI tool for running WASI/WASM components locally without the full OutLayer stack. It uses the real worker execution engine with local filesystem storage — perfect for development and testing.
+
+```bash
+# Build & install
+cd worker && cargo install --bin inlayer --path .
+
+# Run any WASI Preview 2 WASM
+inlayer run nostr-identity '{"action":"stats"}'
+inlayer run my-component --rpc https://rpc.mainnet.near.org
+inlayer list    # discover WASMs in your workspace
+```
+
+Features:
+- **Real NEAR RPC** — `view`/`call` hit actual RPC endpoints
+- **Local storage** — filesystem fallback, no keystore needed
+- **Config via TOML** — `~/.inlayer/config.local.toml` or `./config.local.toml`
+- **Workspace discovery** — auto-finds WASMs in sibling project directories
+
+See `worker/src/bin/inlayer.rs` for source.
 
 ## Documentation
 

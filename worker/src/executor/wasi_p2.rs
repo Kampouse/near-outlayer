@@ -303,14 +303,18 @@ pub async fn execute(
         if let Some(outlayer_rpc) = &ctx.outlayer_rpc {
             debug!("Adding NEAR RPC host functions to linker");
 
-            // Create sync RPC proxy for host functions
-            let rpc_url = outlayer_rpc.get_rpc_url();
-            let sync_proxy = crate::outlayer_rpc::host_functions_sync::RpcProxy::new(
-                rpc_url,
-                100, // max_calls
-                true, // allow_transactions
-                None, // No default signer - WASM provides signing keys
-            )?;
+            // Create sync RPC proxy (uses reqwest::blocking — spawn_blocking to avoid tokio panic)
+            let rpc_url = outlayer_rpc.get_rpc_url().to_string();
+            let sync_proxy = tokio::task::spawn_blocking(move || {
+                crate::outlayer_rpc::host_functions_sync::RpcProxy::new(
+                    &rpc_url,
+                    100,
+                    true,
+                    None,
+                )
+            }).await
+                .context("spawn_blocking for RPC proxy failed")?
+                .context("Failed to create RPC proxy")?;
 
             // Add RPC host functions to linker
             crate::outlayer_rpc::add_rpc_to_linker(&mut linker, |state: &mut HostState| {
@@ -332,8 +336,12 @@ pub async fn execute(
         if let Some(storage_config) = &ctx.storage_config {
             debug!("Adding storage host functions to linker");
 
-            // Create storage client
-            let storage_client = StorageClient::new(storage_config.clone())
+            // Create storage client (uses reqwest::blocking internally — use spawn_blocking)
+            let config_clone = storage_config.clone();
+            let storage_client = tokio::task::spawn_blocking(move || {
+                StorageClient::new(config_clone)
+            }).await
+                .context("spawn_blocking failed")?
                 .context("Failed to create storage client")?;
 
             // Add storage host functions to linker
