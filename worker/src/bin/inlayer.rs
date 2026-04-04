@@ -252,6 +252,165 @@ fn cfg_env(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
+fn cmd_submit(extra_args: &[String]) -> Result<()> {
+    use base64::Engine;
+
+    if extra_args.is_empty() || extra_args[0] == "--help" {
+        eprintln!("Usage: inlayer submit <input_json> [--contract <id>] [--account <id>] [--network <net>]");
+        eprintln!();
+        eprintln!("Submits an execution request to the OutLayer contract.");
+        eprintln!("layerd will pick it up and execute it.");
+        eprintln!();
+        eprintln!("Example:");
+        eprintln!("  inlayer submit '{{\"action\":\"stats\"}}'");
+        eprintln!("  inlayer submit '{{\"action\":\"stats\"}}' --account alice.testnet");
+        std::process::exit(0);
+    }
+
+    // Parse args
+    let mut input = extra_args[0].clone();
+    let mut contract_id = "outlayer.kampouse.testnet".to_string();
+    let mut account_id = "kampouse.testnet".to_string();
+    let mut network = "testnet".to_string();
+    let mut wasm_url = "https://example.com/test.wasm".to_string();
+    let mut deposit = "0.01".to_string();
+
+    let mut i = 1;
+    while i < extra_args.len() {
+        match extra_args[i].as_str() {
+            "--contract" if i + 1 < extra_args.len() => { contract_id = extra_args[i + 1].clone(); i += 2; }
+            "--account" if i + 1 < extra_args.len() => { account_id = extra_args[i + 1].clone(); i += 2; }
+            "--network" if i + 1 < extra_args.len() => { network = extra_args[i + 1].clone(); i += 2; }
+            "--wasm-url" if i + 1 < extra_args.len() => { wasm_url = extra_args[i + 1].clone(); i += 2; }
+            "--deposit" if i + 1 < extra_args.len() => { deposit = extra_args[i + 1].clone(); i += 2; }
+            other => { input = other.to_string(); i += 1; }
+        }
+    }
+
+    let input_b64 = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
+
+    let args_json = serde_json::json!({
+        "source": {
+            "WasmUrl": {
+                "url": wasm_url,
+                "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                "build_target": "wasm32-wasip2"
+            }
+        },
+        "resource_limits": {
+            "max_instructions": 500_000_000_000u64,
+            "max_memory_mb": 256u32,
+            "max_execution_seconds": 60u64
+        },
+        "input_data": input_b64
+    });
+
+    let args_str = serde_json::to_string(&args_json)?;
+
+    eprintln!("📤 Submitting to {}...", contract_id);
+    eprintln!("   Input: {}", input);
+    eprintln!("   Account: {}", account_id);
+
+    let status = std::process::Command::new("near")
+        .args([
+            "contract", "call-function", "as-transaction",
+            &contract_id, "request_execution",
+            "json-args", &args_str,
+            "prepaid-gas", "100.0 Tgas",
+            "attached-deposit", &format!("{} NEAR", deposit),
+            "sign-as", &account_id,
+            "network-config", &network,
+            "sign-with-keychain", "send",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .status()?;
+
+    if status.success() {
+        eprintln!("✅ Request submitted!");
+        eprintln!("   layerd will pick it up automatically.");
+    } else {
+        anyhow::bail!("Failed to submit request");
+    }
+    Ok(())
+}
+
+fn cmd_status(extra_args: &[String]) -> Result<()> {
+    use base64::Engine;
+
+    let mut contract_id = "outlayer.kampouse.testnet".to_string();
+    let mut network = "testnet".to_string();
+
+    let mut i = 0;
+    while i < extra_args.len() {
+        match extra_args[i].as_str() {
+            "--contract" if i + 1 < extra_args.len() => { contract_id = extra_args[i + 1].clone(); i += 2; }
+            "--network" if i + 1 < extra_args.len() => { network = extra_args[i + 1].clone(); i += 2; }
+            _ => { i += 1; }
+        }
+    }
+
+    let output = std::process::Command::new("near")
+        .args([
+            "view", &contract_id,
+            "get_pending_request_ids",
+            r#"{"from_index":0,"limit":10}"#,
+            "--networkId", &network,
+        ])
+        .output()
+        .context("near view failed")?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}{}", stdout, stderr);
+
+    if let Some(idx) = combined.find("return value") {
+        let rest = &combined[idx + 12..];
+        let lines: Vec<&str> = rest.lines().collect();
+        let ids_str = lines.first().unwrap_or(&"").trim();
+        let ids: Vec<u64> = if ids_str == "[]" || ids_str.is_empty() {
+            vec![]
+        } else {
+            ids_str.trim_start_matches('[').trim_end_matches(']')
+                .split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        };
+
+        if ids.is_empty() {
+            eprintln!("✅ No pending requests");
+        } else {
+            eprintln!("📋 Pending requests: {:?}", ids);
+            for id in &ids {
+                let detail = std::process::Command::new("near")
+                    .args([
+                        "view", &contract_id,
+                        "get_request",
+                        &format!("{{\"request_id\":{}}}", id),
+                        "--networkId", &network,
+                    ])
+                    .output().ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+
+                if let Some(idx) = detail.find("return value") {
+                    let rest = &detail[idx + 12..];
+                    if let Some(line) = rest.lines().next() {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                            let input_b64 = val.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
+                            let input_bytes = base64::engine::general_purpose::STANDARD.decode(input_b64).unwrap_or_default();
+                            let input_str = String::from_utf8_lossy(&input_bytes);
+                            let status = if val.get("response").is_some() { "✅ resolved" } else { "⏳ pending" };
+                            eprintln!("   #{} {} input={}", id, status, input_str);
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        eprintln!("❌ Could not parse response");
+    }
+    Ok(())
+}
+
 fn cmd_list(config_dir: &Path) {
     let cfg = Config::load(config_dir);
     let mut all: Vec<PathBuf> = Vec::new();
@@ -319,10 +478,14 @@ fn main() -> Result<()> {
     };
 
     if args.len() < 2 || args[1] == "-h" || args[1] == "--help" || args[1] == "help" {
-        eprintln!("inlayer — Run WASM components against OutLayer\n\n\
-Usage:\n  inlayer run <wasm> <input> [--rpc <url>]\n  inlayer list\n  inlayer config\n\n\
-Config: ./inlayer.config or ~/.inlayer/inlayer.config\n\n\
-Set runner.default_input in config to provide default input JSON.");
+        eprintln!("inlayer — OutLayer local WASM runner + request submission\n\n\
+Usage:\n\
+  inlayer run <wasm> <input> [--rpc <url>]    Run WASM locally\n\
+  inlayer submit <input> [--contract <id>]    Submit request to contract\n\
+  inlayer status [--contract <id>]            Check pending requests\n\
+  inlayer list                                List available WASMs\n\
+  inlayer config                              Show current config\n\n\
+Config: ./inlayer.config or ~/.inlayer/inlayer.config");
         std::process::exit(0);
     }
 
@@ -330,7 +493,6 @@ Set runner.default_input in config to provide default input JSON.");
         "run" => {
             if args.len() < 3 {
                 eprintln!("Usage: inlayer run <wasm> <input> [--rpc <url>]");
-                eprintln!("  Or set runner.default_input in inlayer.config");
                 std::process::exit(1);
             }
             let cfg = Config::load(&config_dir);
@@ -347,6 +509,12 @@ Set runner.default_input in config to provide default input JSON.");
                 }
             }
             cmd_run(&config_dir, wasm, &input, rpc_override.as_deref())?;
+        }
+        "submit" => {
+            cmd_submit(&args[2..])?;
+        }
+        "status" => {
+            cmd_status(&args[2..])?;
         }
         "list" | "ls" => cmd_list(&config_dir),
         "config" => cmd_config(&config_dir),
