@@ -3,7 +3,17 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use serde::Deserialize;
+
+use near_crypto::{InMemorySigner, Signer};
+use near_jsonrpc_client::{methods, JsonRpcClient};
+use near_jsonrpc_primitives::types::query::QueryResponseKind;
+use near_primitives::action::{Action, FunctionCallAction};
+use near_primitives::transaction::{Transaction, TransactionV0};
+use near_primitives::types::BlockReference;
+use near_primitives::types::FunctionArgs;
+use near_primitives::views::QueryRequest;
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -13,8 +23,10 @@ struct Config {
     contract_id: String,
     account_id: String,
     network: String,
+    rpc_url: String,
     poll_interval_secs: u64,
     wasm_search_dirs: Vec<String>,
+    key_path: String,
 }
 
 impl Default for Config {
@@ -24,8 +36,10 @@ impl Default for Config {
             contract_id: "outlayer.kampouse.testnet".into(),
             account_id: "kampouse.testnet".into(),
             network: "testnet".into(),
+            rpc_url: "https://rpc.testnet.near.org".into(),
             poll_interval_secs: 5,
             wasm_search_dirs: vec![format!("{}/.openclaw/workspace", home.display())],
+            key_path: format!("{}/.near-credentials/testnet/kampouse.testnet.json", home.display()),
         }
     }
 }
@@ -44,57 +58,150 @@ impl Config {
     }
 }
 
-// ── NEAR view via RPC ───────────────────────────────────────────────────────
+// ── Key loading ─────────────────────────────────────────────────────────────
 
-fn near_view(contract: &str, method: &str, args: &str, network: &str) -> Result<String> {
-    let output = std::process::Command::new("near")
-        .args(["view", contract, method, args, "--networkId", network])
-        .output()
-        .context("near view failed")?;
+#[derive(Deserialize)]
+struct KeyFile {
+    private_key: String,
+    account_id: String,
+}
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+fn load_signer(path: &str) -> Result<InMemorySigner> {
+    let data = std::fs::read_to_string(path).context("reading key file")?;
+    let kf: KeyFile = serde_json::from_str(&data).context("parsing key file")?;
+    let secret = if kf.private_key.contains(':') {
+        kf.private_key.split(':').last().unwrap().to_string()
+    } else {
+        kf.private_key.clone()
+    };
+    let signer_account_id: near_primitives::types::AccountId = kf.account_id.parse()?;
+    let signer_secret_key: near_crypto::SecretKey = secret.parse()?;
+    Ok(InMemorySigner::from_secret_key(signer_account_id, signer_secret_key))
+}
 
-    if !output.status.success() {
-        anyhow::bail!("near view: {}", stderr);
+// ── NEAR RPC ────────────────────────────────────────────────────────────────
+
+struct Rpc {
+    client: JsonRpcClient,
+    rt: tokio::runtime::Runtime,
+}
+
+impl Rpc {
+    fn new(url: &str) -> Result<Self> {
+        Ok(Self {
+            client: JsonRpcClient::connect(url),
+            rt: tokio::runtime::Runtime::new()?,
+        })
     }
 
-    // near-cli-rs output: "Function execution return value: [json]"
-    if let Some(idx) = stdout.find("return value") {
-        let rest = &stdout[idx + 12..].trim();
-        let lines: Vec<&str> = rest.lines().collect();
-        if let Some(first) = lines.first() {
-            return Ok(first.trim().to_string());
+    fn view(&self, contract: &str, method: &str, args: &[u8]) -> Result<Vec<u8>> {
+        let client = &self.client;
+        self.rt.block_on(async {
+            let request = methods::query::RpcQueryRequest {
+                block_reference: BlockReference::latest(),
+                request: QueryRequest::CallFunction {
+                    account_id: contract.parse()?,
+                    method_name: method.to_string(),
+                    args: serde_json::from_str(&format!("\"{}\"", base64::engine::general_purpose::STANDARD.encode(args)))?,
+                },
+            };
+            let response = client.call(request).await?;
+            if let QueryResponseKind::CallResult(result) = response.kind {
+                Ok(result.result)
+            } else {
+                anyhow::bail!("unexpected query response")
+            }
+        })
+    }
+
+    fn send_tx(&self, signer: &InMemorySigner, contract: &str, method: &str, args: serde_json::Value, gas: u64, deposit: u128) -> Result<String> {
+        let client = &self.client;
+        let signer_account_id = signer.account_id.clone();
+        let signer_public_key = signer.public_key.clone();
+        let signer_clone = signer.clone();
+
+        self.rt.block_on(async {
+            // Get access key for nonce + block hash
+            let access_key_query = methods::query::RpcQueryRequest {
+                block_reference: BlockReference::latest(),
+                request: QueryRequest::ViewAccessKey {
+                    account_id: signer_account_id.clone(),
+                    public_key: signer_public_key.clone(),
+                },
+            };
+            let access_key_response = client.call(access_key_query).await?;
+            let (current_nonce, block_hash) = match access_key_response.kind {
+                QueryResponseKind::AccessKey(ak) => (ak.nonce, access_key_response.block_hash),
+                _ => anyhow::bail!("unexpected access key response"),
+            };
+
+            let args_bytes = serde_json::to_vec(&args)?;
+
+            let transaction = TransactionV0 {
+                signer_id: signer_account_id,
+                public_key: signer_public_key,
+                nonce: current_nonce + 1,
+                receiver_id: contract.parse()?,
+                block_hash,
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: method.to_string(),
+                    args: args_bytes,
+                    gas,
+                    deposit,
+                }))],
+            };
+
+            let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer_clone));
+            let tx_hash = format!("{:?}", signed_tx.get_hash());
+
+            let request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+                signed_transaction: signed_tx,
+            };
+
+            let _response = client.call(request).await?;
+            Ok(tx_hash)
+        })
+    }
+}
+
+// ── Contract calls ──────────────────────────────────────────────────────────
+
+fn get_pending_ids(rpc: &Rpc, contract: &str) -> Result<Vec<u64>> {
+    let args = serde_json::to_vec(&serde_json::json!({"from_index": 0, "limit": 10}))?;
+    let bytes = rpc.view(contract, "get_pending_request_ids", &args)?;
+    if bytes.is_empty() { return Ok(vec![]); }
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn get_request_input(rpc: &Rpc, contract: &str, request_id: u64) -> Result<String> {
+    let args = serde_json::to_vec(&serde_json::json!({"request_id": request_id}))?;
+    let bytes = rpc.view(contract, "get_request", &args)?;
+    if bytes.is_empty() { anyhow::bail!("request {} not found", request_id); }
+    let req: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let input_b64 = req.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
+    let decoded = base64::engine::general_purpose::STANDARD.decode(input_b64).unwrap_or_default();
+    Ok(String::from_utf8_lossy(&decoded).to_string())
+}
+
+fn resolve(
+    rpc: &Rpc, signer: &InMemorySigner, contract: &str,
+    request_id: u64, success: bool, output: &str, time_ms: u64, instructions: u64,
+) -> Result<String> {
+    let args = serde_json::json!({
+        "request_id": request_id,
+        "response": {
+            "success": success,
+            "output": {"Text": output},
+            "error": if success { serde_json::Value::Null } else { serde_json::Value::String("Execution failed".into()) },
+            "resources_used": {"instructions": instructions, "time_ms": time_ms},
+            "compilation_note": null,
+            "refund_usd": null,
         }
-    }
-
-    Ok(stdout.trim().to_string())
+    });
+    rpc.send_tx(signer, contract, "resolve_execution", args, 100_000_000_000_000, 0)
 }
 
-fn get_pending_ids(contract: &str, network: &str) -> Result<Vec<u64>> {
-    let raw = near_view(contract, "get_pending_request_ids", r#"{"from_index":0,"limit":10}"#, network)?;
-    // Parse [0, 7] or [7] or []
-    let cleaned = raw.trim().trim_start_matches('[').trim_end_matches(']');
-    if cleaned.is_empty() {
-        return Ok(vec![]);
-    }
-    let ids: Vec<u64> = cleaned.split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-    Ok(ids)
-}
-
-fn get_request_input(contract: &str, request_id: u64, network: &str) -> Result<String> {
-    let args = format!(r#"{{"request_id":{}}}"#, request_id);
-    let raw = near_view(contract, "get_request", &args, network)?;
-    // Extract input_data field (base64 encoded)
-    let val: serde_json::Value = serde_json::from_str(&raw).context("parse request")?;
-    let input_b64 = val.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
-    let bytes = base64::decode(input_b64).unwrap_or_default();
-    Ok(String::from_utf8_lossy(&bytes).to_string())
-}
-
-// ── WASM discovery ──────────────────────────────────────────────────────────
+// ── WASM discovery & execution ──────────────────────────────────────────────
 
 fn find_wasm(search_dirs: &[String]) -> Option<PathBuf> {
     for dir in search_dirs {
@@ -116,8 +223,6 @@ fn find_wasm(search_dirs: &[String]) -> Option<PathBuf> {
     None
 }
 
-// ── Execute via inlayer ─────────────────────────────────────────────────────
-
 fn execute_wasm(wasm_path: &Path, input: &str, network: &str) -> Result<(bool, String, u64, u64)> {
     let rpc = format!("https://rpc.{}.near.org", network);
     let output = std::process::Command::new("inlayer")
@@ -128,16 +233,9 @@ fn execute_wasm(wasm_path: &Path, input: &str, network: &str) -> Result<(bool, S
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Parse output
     let success = stdout.contains("✅ Success: true");
-    let time_ms = extract_number(&stderr, "Time:")
-        .or_else(|| extract_number(&stdout, "Time:"))
-        .unwrap_or(0);
-    let instructions = extract_number_after(&stdout, "Instructions:")
-        .or_else(|| extract_number_after(&stderr, "Instructions:"))
-        .unwrap_or(0);
-
-    // Get output payload
+    let time_ms = extract_num(&stdout, "Time:").or_else(|| extract_num(&stderr, "Time:")).unwrap_or(0);
+    let instructions = extract_num_after(&stdout, "Instructions:").or_else(|| extract_num_after(&stderr, "Instructions:")).unwrap_or(0);
     let output_text = stdout.lines()
         .find(|l| l.starts_with("📤 Output:"))
         .map(|l| l.trim_start_matches("📤 Output: ").to_string())
@@ -146,56 +244,15 @@ fn execute_wasm(wasm_path: &Path, input: &str, network: &str) -> Result<(bool, S
     Ok((success, output_text, time_ms, instructions))
 }
 
-fn extract_number(text: &str, prefix: &str) -> Option<u64> {
+fn extract_num(text: &str, prefix: &str) -> Option<u64> {
     text.lines().find(|l| l.contains(prefix))?
-        .split_whitespace()
-        .find_map(|w| w.parse::<u64>().ok())
+        .split_whitespace().find_map(|w| w.parse::<u64>().ok())
 }
 
-fn extract_number_after(text: &str, prefix: &str) -> Option<u64> {
+fn extract_num_after(text: &str, prefix: &str) -> Option<u64> {
     let line = text.lines().find(|l| l.contains(prefix))?;
     let after = line.split(prefix).nth(1)?;
     after.trim().split_whitespace().next()?.parse().ok()
-}
-
-// ── Submit result ───────────────────────────────────────────────────────────
-
-fn submit_result(contract: &str, account: &str, network: &str, request_id: u64, success: bool, output: &str, time_ms: u64, instructions: u64) -> Result<()> {
-    let args = serde_json::json!({
-        "request_id": request_id,
-        "response": {
-            "success": success,
-            "output": {"Text": output},
-            "error": if success { serde_json::Value::Null } else { serde_json::Value::String("Execution failed".into()) },
-            "resources_used": {"instructions": instructions, "time_ms": time_ms},
-            "compilation_note": null,
-            "refund_usd": null,
-        }
-    });
-    let args_str = serde_json::to_string(&args)?;
-
-    eprintln!("   📤 Submitting...");
-    let status = std::process::Command::new("near")
-        .args([
-            "contract", "call-function", "as-transaction",
-            contract, "resolve_execution",
-            "json-args", &args_str,
-            "prepaid-gas", "100.0 Tgas",
-            "attached-deposit", "0 NEAR",
-            "sign-as", account,
-            "network-config", network,
-            "sign-with-keychain", "send",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()?;
-
-    if status.success() {
-        eprintln!("   ✅ Submitted!");
-        Ok(())
-    } else {
-        anyhow::bail!("near call failed");
-    }
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────
@@ -203,16 +260,21 @@ fn submit_result(contract: &str, account: &str, network: &str, request_id: u64, 
 fn main() -> Result<()> {
     let cfg = Config::load();
 
-    eprintln!("⚡ layerd — OutLayer local worker");
+    eprintln!("⚡ layerd — OutLayer local worker (direct RPC)");
     eprintln!("   Contract: {}", cfg.contract_id);
     eprintln!("   Account:  {}", cfg.account_id);
+    eprintln!("   RPC:      {}", cfg.rpc_url);
     eprintln!("   Poll:     {}s", cfg.poll_interval_secs);
+
+    let signer = load_signer(&cfg.key_path)?;
+    eprintln!("   Key: {}", signer.public_key);
     eprintln!();
 
+    let rpc = Rpc::new(&cfg.rpc_url)?;
     let mut processed: HashSet<u64> = HashSet::new();
 
     loop {
-        match get_pending_ids(&cfg.contract_id, &cfg.network) {
+        match get_pending_ids(&rpc, &cfg.contract_id) {
             Ok(ids) => {
                 if ids.is_empty() {
                     eprintln!("{} No pending", now());
@@ -223,37 +285,31 @@ fn main() -> Result<()> {
                         if processed.contains(req_id) { continue; }
                         eprintln!("\n📋 Request #{}", req_id);
 
-                        // Get input
-                        let input = match get_request_input(&cfg.contract_id, *req_id, &cfg.network) {
+                        let input = match get_request_input(&rpc, &cfg.contract_id, *req_id) {
                             Ok(i) => i,
                             Err(e) => { eprintln!("   ❌ {}", e); continue; }
                         };
                         eprintln!("   Input: {}", input);
 
-                        // Find WASM
                         let wasm = match find_wasm(&cfg.wasm_search_dirs) {
                             Some(w) => w,
                             None => { eprintln!("   ❌ WASM not found"); continue; }
                         };
                         eprintln!("   WASM: {}", wasm.display());
 
-                        // Execute
                         eprintln!("   🏃 Running...");
                         match execute_wasm(&wasm, &input, &cfg.network) {
                             Ok((success, output, time_ms, instructions)) => {
                                 eprintln!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions);
                                 eprintln!("   📤 {}", output);
-                                let _ = submit_result(
-                                    &cfg.contract_id, &cfg.account_id, &cfg.network,
-                                    *req_id, success, &output, time_ms, instructions,
-                                );
+                                match resolve(&rpc, &signer, &cfg.contract_id, *req_id, success, &output, time_ms, instructions) {
+                                    Ok(tx_hash) => eprintln!("   ✅ Tx: {}", tx_hash),
+                                    Err(e) => eprintln!("   ❌ Submit failed: {}", e),
+                                }
                             }
                             Err(e) => {
                                 eprintln!("   ❌ {}", e);
-                                let _ = submit_result(
-                                    &cfg.contract_id, &cfg.account_id, &cfg.network,
-                                    *req_id, false, "", 0, 0,
-                                );
+                                let _ = resolve(&rpc, &signer, &cfg.contract_id, *req_id, false, "", 0, 0);
                             }
                         }
                         processed.insert(*req_id);
