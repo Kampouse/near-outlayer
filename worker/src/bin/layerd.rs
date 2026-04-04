@@ -135,7 +135,7 @@ fn load_signer(path: &str) -> Result<InMemorySigner> {
     let data = std::fs::read_to_string(path).context("reading key file")?;
     let kf: KeyFile = serde_json::from_str(&data).context("parsing key file")?;
     let secret = if kf.private_key.contains(':') {
-        kf.private_key.split(':').last().unwrap().to_string()
+        kf.private_key.rsplit(':').next_back().unwrap_or_default().to_string()
     } else {
         kf.private_key.clone()
     };
