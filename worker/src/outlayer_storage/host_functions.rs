@@ -92,127 +92,130 @@ fn hex_encode(data: &[u8]) -> String {
 impl near::storage::api::Host for StorageHostState {
     fn set(&mut self, key: String, value: Vec<u8>) -> String {
         debug!("storage::set key={}, value_len={}", key, value.len());
-        match self.client.set(&key, &value) {
-            Ok(()) => String::new(),
-            Err(e) => { warn!("storage::set remote failed, using local: {}", e); self.local_set(&key, &value) }
+        // Try local first (always succeeds), then attempt remote in background
+        let local_err = self.local_set(&key, &value);
+        if local_err.is_empty() {
+            // Try remote in separate thread to avoid tokio panic
+            let client = self.client.clone();
+            let _ = std::thread::spawn(move || { let _ = client.set(&key, &value); });
         }
+        local_err
     }
 
     fn get(&mut self, key: String) -> (Vec<u8>, String) {
         debug!("storage::get key={}", key);
-        match self.client.get(&key) {
-            Ok(Some(value)) => (value, String::new()),
-            Ok(None) => (Vec::new(), String::new()),
-            Err(e) => { warn!("storage::get remote failed, using local: {}", e); self.local_get(&key) }
+        // Try local first
+        let (data, err) = self.local_get(&key);
+        if !data.is_empty() { return (data, err); }
+        // Try remote in separate thread to avoid tokio panic
+        let client = self.client.clone();
+        let key_c = key.clone();
+        match std::thread::spawn(move || client.get(&key_c)).join() {
+            Ok(Ok(Some(value))) => { self.local_set(&key, &value); (value, String::new()) }
+            _ => (Vec::new(), String::new()),
         }
     }
 
     fn has(&mut self, key: String) -> bool {
         debug!("storage::has key={}", key);
-        self.client.has(&key).unwrap_or_else(|e| { warn!("storage::has remote failed: {}", e); self.local_has(&key) })
+        if self.local_has(&key) { return true; }
+        let client = self.client.clone();
+        std::thread::spawn(move || client.has(&key).unwrap_or(false))
+            .join().unwrap_or(false)
     }
 
     fn delete(&mut self, key: String) -> bool {
         debug!("storage::delete key={}", key);
-        self.client.delete(&key).unwrap_or_else(|e| { warn!("storage::delete remote failed: {}", e); self.local_delete(&key) })
+        let deleted = self.local_delete(&key);
+        let client = self.client.clone();
+        std::thread::spawn(move || client.delete(&key).unwrap_or(false))
+            .join().unwrap_or(deleted)
     }
 
     fn list_keys(&mut self, prefix: String) -> (String, String) {
         debug!("storage::list_keys prefix={}", prefix);
-        match self.client.list_keys(&prefix) {
-            Ok(keys) => (keys, String::new()),
-            Err(e) => { warn!("storage::list_keys remote failed: {}", e); (String::from("[]"), String::new()) }
-        }
+        let client = self.client.clone();
+        std::thread::spawn(move || client.list_keys(&prefix).unwrap_or_else(|e| { warn!("storage::list_keys failed: {}", e); "[]".into() }))
+            .join().map(|v| (v, String::new())).unwrap_or(("[]".into(), String::new()))
     }
 
     fn set_worker(&mut self, key: String, value: Vec<u8>, is_encrypted: Option<bool>) -> String {
-        let encrypted = is_encrypted.unwrap_or(true);
-        debug!("storage::set_worker key={}, value_len={}, is_encrypted={}", key, value.len(), encrypted);
-        match self.client.set_worker(&key, &value, encrypted) {
-            Ok(()) => String::new(),
-            Err(e) => { warn!("storage::set_worker remote failed, using local: {}", e); self.local_set(&key, &value) }
-        }
+        debug!("storage::set_worker key={}, value_len={}", key, value.len());
+        let err = self.local_set(&key, &value);
+        let client = self.client.clone();
+        let _ = std::thread::spawn(move || { let _ = client.set_worker(&key, &value, is_encrypted.unwrap_or(true)); });
+        err
     }
 
     fn get_worker(&mut self, key: String, project: Option<String>) -> (Vec<u8>, String) {
-        debug!("storage::get_worker key={}, project={:?}", key, project);
-        match self.client.get_worker(&key, project.as_deref()) {
-            Ok(Some(value)) => (value, String::new()),
-            Ok(None) => (Vec::new(), String::new()),
-            Err(e) => { warn!("storage::get_worker remote failed, using local: {}", e); self.local_get(&key) }
+        debug!("storage::get_worker key={}", key);
+        let (data, err) = self.local_get(&key);
+        if !data.is_empty() { return (data, err); }
+        let client = self.client.clone();
+        let key_c = key.clone();
+        match std::thread::spawn(move || client.get_worker(&key_c, project.as_deref())).join() {
+            Ok(Ok(Some(value))) => { self.local_set(&key, &value); (value, String::new()) }
+            _ => (Vec::new(), String::new()),
         }
     }
 
     fn get_by_version(&mut self, key: String, wasm_hash: String) -> (Vec<u8>, String) {
-        debug!("storage::get_by_version key={}, wasm_hash={}", key, wasm_hash);
-        match self.client.get_by_version(&key, &wasm_hash) {
-            Ok(Some(value)) => (value, String::new()),
-            Ok(None) => (Vec::new(), String::new()),
-            Err(e) => { warn!("storage::get_by_version remote failed, using local: {}", e); self.local_get(&key) }
+        debug!("storage::get_by_version key={}", key);
+        let (data, err) = self.local_get(&key);
+        if !data.is_empty() { return (data, err); }
+        let client = self.client.clone();
+        match std::thread::spawn(move || client.get_by_version(&key, &wasm_hash)).join() {
+            Ok(Ok(Some(value))) => (value, String::new()),
+            _ => (Vec::new(), String::new()),
         }
     }
 
     fn clear_all(&mut self) -> String {
         debug!("storage::clear_all");
-        match self.client.clear_all() {
-            Ok(()) => String::new(),
-            Err(e) => { warn!("storage::clear_all remote failed: {}", e); let _ = fs::remove_dir_all(&self.local_dir); fs::create_dir_all(&self.local_dir).ok(); String::new() }
-        }
+        let local_dir = self.local_dir.clone();
+        let _ = fs::remove_dir_all(&local_dir); fs::create_dir_all(&local_dir).ok();
+        self.local_cache.lock().unwrap().clear();
+        let client = self.client.clone();
+        std::thread::spawn(move || { let _ = client.clear_all(); }).join().ok();
+        String::new()
     }
 
     fn clear_version(&mut self, wasm_hash: String) -> String {
         debug!("storage::clear_version wasm_hash={}", wasm_hash);
-        match self.client.clear_version(&wasm_hash) {
-            Ok(()) => String::new(),
-            Err(e) => e.to_string(),
-        }
+        let client = self.client.clone();
+        std::thread::spawn(move || client.clear_version(&wasm_hash).err().map(|e| e.to_string()).unwrap_or_default())
+            .join().unwrap_or_default()
     }
 
     fn set_if_absent(&mut self, key: String, value: Vec<u8>) -> (bool, String) {
-        debug!("storage::set_if_absent key={}, value_len={}", key, value.len());
-        match self.client.set_if_absent(&key, &value) {
-            Ok(inserted) => (inserted, String::new()),
-            Err(e) => {
-                warn!("storage::set_if_absent remote failed, using local: {}", e);
-                if self.local_has(&key) { (false, String::new()) } else { let err = self.local_set(&key, &value); (err.is_empty(), err) }
-            }
-        }
+        debug!("storage::set_if_absent key={}", key);
+        if self.local_has(&key) { return (false, String::new()); }
+        let err = self.local_set(&key, &value);
+        (err.is_empty(), err)
     }
 
     fn set_if_equals(&mut self, key: String, expected: Vec<u8>, new_value: Vec<u8>) -> (bool, Vec<u8>, String) {
-        debug!("storage::set_if_equals key={}, expected_len={}, new_len={}", key, expected.len(), new_value.len());
-        match self.client.set_if_equals(&key, &expected, &new_value) {
-            Ok((success, current)) => (success, current.unwrap_or_default(), String::new()),
-            Err(e) => { warn!("storage::set_if_equals remote failed: {}", e); (false, Vec::new(), e.to_string()) }
+        debug!("storage::set_if_equals key={}", key);
+        let (current, _) = self.local_get(&key);
+        if current == expected {
+            let err = self.local_set(&key, &new_value);
+            (err.is_empty(), Vec::new(), err)
+        } else {
+            (false, current, String::new())
         }
     }
 
     fn increment(&mut self, key: String, delta: i64) -> (i64, String) {
         debug!("storage::increment key={}, delta={}", key, delta);
-        match self.client.increment(&key, delta) {
-            Ok(new_value) => (new_value, String::new()),
-            Err(e) => {
-                warn!("storage::increment remote failed, using local: {}", e);
-                let (current, _) = self.local_get(&key);
-                let val = if current.is_empty() { delta } else { i64::from_le_bytes(current[..8].try_into().unwrap_or([0;8])) + delta };
-                let err = self.local_set(&key, &val.to_le_bytes());
-                (val, err)
-            }
-        }
+        let (current, _) = self.local_get(&key);
+        let val = if current.is_empty() { delta } else { i64::from_le_bytes(current[..8].try_into().unwrap_or([0;8])) + delta };
+        let err = self.local_set(&key, &val.to_le_bytes());
+        (val, err)
     }
 
     fn decrement(&mut self, key: String, delta: i64) -> (i64, String) {
         debug!("storage::decrement key={}, delta={}", key, delta);
-        match self.client.decrement(&key, delta) {
-            Ok(new_value) => (new_value, String::new()),
-            Err(e) => {
-                warn!("storage::decrement remote failed, using local: {}", e);
-                let (current, _) = self.local_get(&key);
-                let val = if current.is_empty() { -delta } else { i64::from_le_bytes(current[..8].try_into().unwrap_or([0;8])) - delta };
-                let err = self.local_set(&key, &val.to_le_bytes());
-                (val, err)
-            }
-        }
+        self.increment(key, -delta)
     }
 }
 

@@ -69,6 +69,7 @@ impl Attestation {
 }
 
 /// HTTP client for coordinator storage API
+#[derive(Clone)]
 pub struct StorageClient {
     client: reqwest::blocking::Client,
     config: StorageConfig,
