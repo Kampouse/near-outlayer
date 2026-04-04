@@ -11,6 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as AnyhowContext, Result};
+use near_crypto::InMemorySigner;
+use near_jsonrpc_client::JsonRpcClient;
+use near_jsonrpc_primitives::types::query::QueryResponseKind;
+use near_primitives::action::{Action, FunctionCallAction};
+use near_primitives::transaction::{Transaction, TransactionV0};
+use near_primitives::types::BlockReference;
+use near_primitives::views::QueryRequest;
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
@@ -257,13 +264,10 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
 
     if extra_args.is_empty() || extra_args[0] == "--help" {
         eprintln!("Usage: inlayer submit <input_json> [--contract <id>] [--account <id>] [--network <net>]");
+        eprintln!("       inlayer submit <input_json> --wasm-url <url> --deposit <near>");
         eprintln!();
         eprintln!("Submits an execution request to the OutLayer contract.");
         eprintln!("layerd will pick it up and execute it.");
-        eprintln!();
-        eprintln!("Example:");
-        eprintln!("  inlayer submit '{{\"action\":\"stats\"}}'");
-        eprintln!("  inlayer submit '{{\"action\":\"stats\"}}' --account alice.testnet");
         std::process::exit(0);
     }
 
@@ -273,7 +277,7 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
     let mut account_id = "kampouse.testnet".to_string();
     let mut network = "testnet".to_string();
     let mut wasm_url = "https://example.com/test.wasm".to_string();
-    let mut deposit = "0.01".to_string();
+    let mut deposit_str = "0.01".to_string();
 
     let mut i = 1;
     while i < extra_args.len() {
@@ -282,10 +286,19 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
             "--account" if i + 1 < extra_args.len() => { account_id = extra_args[i + 1].clone(); i += 2; }
             "--network" if i + 1 < extra_args.len() => { network = extra_args[i + 1].clone(); i += 2; }
             "--wasm-url" if i + 1 < extra_args.len() => { wasm_url = extra_args[i + 1].clone(); i += 2; }
-            "--deposit" if i + 1 < extra_args.len() => { deposit = extra_args[i + 1].clone(); i += 2; }
+            "--deposit" if i + 1 < extra_args.len() => { deposit_str = extra_args[i + 1].clone(); i += 2; }
             other => { input = other.to_string(); i += 1; }
         }
     }
+
+    let rpc_url = match network.as_str() {
+        "mainnet" => "https://rpc.mainnet.near.org".to_string(),
+        "testnet" => "https://test.rpc.fastnear.com".to_string(),
+        other => other.to_string(),
+    };
+
+    let deposit: f64 = deposit_str.parse().context("invalid deposit amount")?;
+    let deposit_yocto = (deposit * 1e24) as u128;
 
     let input_b64 = base64::engine::general_purpose::STANDARD.encode(input.as_bytes());
 
@@ -304,35 +317,82 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
         },
         "input_data": input_b64
     });
-
-    let args_str = serde_json::to_string(&args_json)?;
+    let args_bytes = serde_json::to_vec(&args_json)?;
 
     eprintln!("📤 Submitting to {}...", contract_id);
     eprintln!("   Input: {}", input);
     eprintln!("   Account: {}", account_id);
 
-    let status = std::process::Command::new("near")
-        .args([
-            "contract", "call-function", "as-transaction",
-            &contract_id, "request_execution",
-            "json-args", &args_str,
-            "prepaid-gas", "100.0 Tgas",
-            "attached-deposit", &format!("{} NEAR", deposit),
-            "sign-as", &account_id,
-            "network-config", &network,
-            "sign-with-keychain", "send",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .status()?;
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = JsonRpcClient::connect(&rpc_url);
+        let signer = find_signer(&account_id, &network)?;
 
-    if status.success() {
-        eprintln!("✅ Request submitted!");
+        let query_response = client
+            .call(near_jsonrpc_client::methods::query::RpcQueryRequest {
+                block_reference: BlockReference::latest(),
+                request: QueryRequest::ViewAccessKey { account_id: account_id.parse()?, public_key: signer.public_key() },
+            })
+            .await
+            .context("query access key failed")?;
+
+        let nonce = match query_response.kind {
+            QueryResponseKind::AccessKey(ak) => ak.nonce,
+            _ => anyhow::bail!("unexpected query response"),
+        };
+
+        let transaction = TransactionV0 {
+            signer_id: account_id.parse()?,
+            public_key: signer.public_key.clone(),
+            nonce: nonce + 1,
+            receiver_id: contract_id.parse()?,
+            block_hash: query_response.block_hash,
+            actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                method_name: "request_execution".into(),
+                args: args_bytes,
+                gas: 100_000_000_000_000,
+                deposit: deposit_yocto,
+            }))],
+        };
+
+        let signed_tx = Transaction::V0(transaction).sign(&near_crypto::Signer::InMemory(signer));
+        let tx_hash = signed_tx.get_hash();
+
+        client
+            .call(near_jsonrpc_client::methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
+                signed_transaction: signed_tx,
+            })
+            .await
+            .context("broadcast tx failed")?;
+
+        eprintln!("✅ Submitted! tx: {}", tx_hash);
         eprintln!("   layerd will pick it up automatically.");
-    } else {
-        anyhow::bail!("Failed to submit request");
+        Ok(())
+    })
+}
+
+/// Find signer key from ~/.near-credentials
+fn find_signer(account_id: &str, network: &str) -> Result<InMemorySigner> {
+    use near_crypto::SecretKey;
+    use near_primitives::types::AccountId;
+
+    let home = dirs::home_dir().context("no home dir")?;
+    let key_path = home.join(format!(".near-credentials/{}/{}.json", network, account_id));
+    if !key_path.exists() {
+        anyhow::bail!("Key not found at {}. Run: near login", key_path.display());
     }
-    Ok(())
+    let data = std::fs::read_to_string(&key_path)
+        .with_context(|| format!("reading {}", key_path.display()))?;
+    let kf: serde_json::Value = serde_json::from_str(&data)?;
+    let private_key = kf["private_key"].as_str().unwrap_or("");
+    let secret = if private_key.contains(':') {
+        private_key.split(':').last().unwrap().to_string()
+    } else {
+        private_key.to_string()
+    };
+    let account_id: AccountId = account_id.parse()?;
+    let secret_key: SecretKey = secret.parse()?;
+    Ok(InMemorySigner::from_secret_key(account_id, secret_key))
 }
 
 fn cmd_status(extra_args: &[String]) -> Result<()> {
@@ -350,65 +410,73 @@ fn cmd_status(extra_args: &[String]) -> Result<()> {
         }
     }
 
-    let output = std::process::Command::new("near")
-        .args([
-            "view", &contract_id,
-            "get_pending_request_ids",
-            r#"{"from_index":0,"limit":10}"#,
-            "--networkId", &network,
-        ])
-        .output()
-        .context("near view failed")?;
+    let rpc_url = match network.as_str() {
+        "mainnet" => "https://rpc.mainnet.near.org".to_string(),
+        "testnet" => "https://test.rpc.fastnear.com".to_string(),
+        other => format!("https://rpc.{}.near.org", other),
+    };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let client = JsonRpcClient::connect(&rpc_url);
 
-    if let Some(idx) = combined.find("return value") {
-        let rest = &combined[idx + 12..];
-        let lines: Vec<&str> = rest.lines().collect();
-        let ids_str = lines.first().unwrap_or(&"").trim();
-        let ids: Vec<u64> = if ids_str == "[]" || ids_str.is_empty() {
-            vec![]
-        } else {
-            ids_str.trim_start_matches('[').trim_end_matches(']')
-                .split(',').filter_map(|s| s.trim().parse().ok()).collect()
+        let resp = client
+            .call(near_jsonrpc_client::methods::query::RpcQueryRequest {
+                block_reference: BlockReference::latest(),
+                request: QueryRequest::CallFunction {
+                    account_id: contract_id.parse()?,
+                    method_name: "get_pending_request_ids".into(),
+                    args: near_primitives::types::FunctionArgs::from(
+                        serde_json::to_vec(&serde_json::json!({"from_index":0,"limit":10}))?
+                    ),
+                },
+            })
+            .await
+            .context("query pending requests failed")?;
+
+        let ids: Vec<u64> = match resp.kind {
+            QueryResponseKind::CallResult(result) => {
+                serde_json::from_slice(&result.result).unwrap_or_default()
+            }
+            _ => anyhow::bail!("unexpected response"),
         };
 
         if ids.is_empty() {
             eprintln!("✅ No pending requests");
-        } else {
-            eprintln!("📋 Pending requests: {:?}", ids);
-            for id in &ids {
-                let detail = std::process::Command::new("near")
-                    .args([
-                        "view", &contract_id,
-                        "get_request",
-                        &format!("{{\"request_id\":{}}}", id),
-                        "--networkId", &network,
-                    ])
-                    .output().ok()
-                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                    .unwrap_or_default();
+            return Ok(());
+        }
 
-                if let Some(idx) = detail.find("return value") {
-                    let rest = &detail[idx + 12..];
-                    if let Some(line) = rest.lines().next() {
-                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                            let input_b64 = val.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
-                            let input_bytes = base64::engine::general_purpose::STANDARD.decode(input_b64).unwrap_or_default();
-                            let input_str = String::from_utf8_lossy(&input_bytes);
-                            let status = if val.get("response").is_some() { "✅ resolved" } else { "⏳ pending" };
-                            eprintln!("   #{} {} input={}", id, status, input_str);
-                        }
+        eprintln!("📋 Pending requests: {:?}", ids);
+
+        for id in &ids {
+            let args = serde_json::json!({"request_id": id});
+            let args_bytes = serde_json::to_vec(&args)?;
+
+            let resp = client
+                .call(near_jsonrpc_client::methods::query::RpcQueryRequest {
+                    block_reference: BlockReference::latest(),
+                    request: QueryRequest::CallFunction {
+                        account_id: contract_id.parse()?,
+                        method_name: "get_request".into(),
+                        args: near_primitives::types::FunctionArgs::from(args_bytes),
+                    },
+                })
+                .await;
+
+            if let Ok(resp) = resp {
+                if let QueryResponseKind::CallResult(result) = resp.kind {
+                    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&result.result) {
+                        let input_b64 = val.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
+                        let input_bytes = base64::engine::general_purpose::STANDARD.decode(input_b64).unwrap_or_default();
+                        let input_str = String::from_utf8_lossy(&input_bytes);
+                        let status = if val.get("response").is_some() { "✅ resolved" } else { "⏳ pending" };
+                        eprintln!("   #{} {} input={}", id, status, input_str);
                     }
                 }
             }
         }
-    } else {
-        eprintln!("❌ Could not parse response");
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn cmd_list(config_dir: &Path) {
