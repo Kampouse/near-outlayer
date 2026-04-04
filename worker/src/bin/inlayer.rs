@@ -243,7 +243,7 @@ fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option
     }
     if let Some(error) = &result.error { println!("❌ Error: {}", error); }
 
-    std::mem::forget(rt);
+    std::mem::forget(rt); // Leak runtime to avoid "Cannot drop runtime" panic (CLI tool, negligible)
     Ok(())
 }
 
