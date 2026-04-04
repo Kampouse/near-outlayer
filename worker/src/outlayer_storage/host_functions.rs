@@ -106,7 +106,7 @@ impl StorageHostState {
 }
 
 // Hex encoding helper
-fn hex_encode(data: &[u8]) -> String {
+fn _hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect()
 }
 

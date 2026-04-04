@@ -16,9 +16,9 @@ use near_jsonrpc_primitives::types::query::QueryResponseKind;
 use near_primitives::action::{Action, FunctionCallAction};
 use near_primitives::transaction::{Transaction, TransactionV0};
 use near_primitives::types::BlockReference;
-use near_primitives::types::FunctionArgs;
 use near_primitives::views::QueryRequest;
 
+// Executor imports used in execute_wasm()
 use offchainvm_worker::api_client::{ExecutionOutput, ResourceLimits, ResponseFormat};
 use offchainvm_worker::config::RpcProxyConfig;
 use offchainvm_worker::executor::{ExecutionContext, Executor};
@@ -90,7 +90,7 @@ impl Config {
 
 // ── Daemon ──────────────────────────────────────────────────────────────────
 
-fn daemonize(log_path: &Path, pid_path: &Path) -> Result<()> {
+fn daemonize(_log_path: &Path, pid_path: &Path) -> Result<()> {
     if let Some(parent) = pid_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -285,11 +285,6 @@ fn find_wasm(search_dirs: &[String]) -> Option<PathBuf> {
 }
 
 fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str) -> Result<(bool, String, u64, u64)> {
-    use offchainvm_worker::api_client::ExecutionOutput;
-    use offchainvm_worker::api_client::{ResourceLimits, ResponseFormat};
-    use offchainvm_worker::config::RpcProxyConfig;
-    use offchainvm_worker::executor::{ExecutionContext, Executor};
-    use offchainvm_worker::outlayer_rpc::RpcProxy;
 
     let wasm_bytes = fs::read(wasm_path)
         .with_context(|| format!("reading {}", wasm_path.display()))?;
@@ -528,12 +523,12 @@ fn read_pid(pid_path: &Path) -> Result<u32> {
     Ok(s.trim().parse()?)
 }
 
-fn ctrlc_handler(pid_path: &Path) {
+fn ctrlc_handler(_pid_path: &Path) {
     // Stale PID files are handled by is_running() which checks actual process
     // Just a marker — no complex signal handling needed
 }
 
-fn start_daemon(cfg: &Config) -> Result<()> {
+fn start_daemon(_cfg: &Config) -> Result<()> {
     let plist = dirs::home_dir()
         .map(|h| h.join("Library/LaunchAgents/com.outlayer.layerd.plist"))
         .filter(|p| p.exists());
@@ -620,7 +615,7 @@ fn tail_log(cfg: &Config) -> Result<()> {
         eprintln!("No log file at {}", log_path.display());
         return Ok(());
     }
-    let output = std::process::Command::new("tail")
+    let _ = std::process::Command::new("tail")
         .args(["-20", &log_path.display().to_string()])
         .status()?;
     Ok(())
