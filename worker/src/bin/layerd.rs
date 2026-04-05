@@ -11,6 +11,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 use near_crypto::{InMemorySigner, Signer};
 use near_jsonrpc_client::{methods, JsonRpcClient};
@@ -24,6 +25,7 @@ use near_primitives::views::QueryRequest;
 // Executor imports used in execute_wasm()
 use offchainvm_worker::api_client::{ExecutionOutput, ResourceLimits, ResponseFormat};
 use offchainvm_worker::config::RpcProxyConfig;
+use offchainvm_worker::compiled_cache::CompiledCache;
 use offchainvm_worker::executor::{ExecutionContext, Executor};
 use offchainvm_worker::outlayer_rpc::RpcProxy;
 
@@ -54,6 +56,23 @@ static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 fn shared_runtime() -> &'static tokio::runtime::Runtime {
     SHARED_RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("failed to create shared runtime"))
+}
+
+/// Shared compiled WASM cache — avoids re-JIT on every execution.
+static COMPILED_CACHE: OnceLock<Arc<std::sync::Mutex<CompiledCache>>> = OnceLock::new();
+
+fn init_compiled_cache() {
+    let home = dirs::home_dir().unwrap_or_default();
+    let cache_dir = home.join(".inlayer").join("compiled_cache");
+    let secret_key_bytes: [u8; 32] = [0u8; 32]; // TODO: derive from worker key
+    match CompiledCache::new(cache_dir, 500, &secret_key_bytes) {
+        Ok(cache) => { COMPILED_CACHE.set(Arc::new(std::sync::Mutex::new(cache))).ok(); }
+        Err(e) => eprintln!("⚠️ Compiled cache init failed: {}", e),
+    }
+}
+
+fn compiled_cache() -> Option<Arc<std::sync::Mutex<CompiledCache>>> {
+    COMPILED_CACHE.get().cloned()
 }
 
 // ── Execution Record (shared state) ─────────────────────────────────────────
@@ -612,7 +631,7 @@ fn execute_single_wasm(
         outlayer_rpc: Some(Arc::new(proxy)),
         storage_config: None,
         runtime_handle: handle,
-        compiled_cache: None,
+        compiled_cache: compiled_cache(),
         vrf_config: None,
         wallet_config: None,
     };
@@ -627,8 +646,18 @@ fn execute_single_wasm(
 
     let env = if env_vars.is_empty() { None } else { Some(env_vars.clone()) };
 
+    // Compute WASM checksum for compiled cache lookup
+    let wasm_checksum = {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(64);
+        for &b in sha2::Sha256::digest(wasm_bytes).iter() {
+            write!(&mut s, "{:02x}", b).unwrap();
+        }
+        s
+    };
+
     let result = rt.block_on(executor.execute(
-        wasm_bytes, None, input.as_bytes(), &limits,
+        wasm_bytes, Some(&wasm_checksum), input.as_bytes(), &limits,
         env, Some("wasm32-wasip2"), &ResponseFormat::Text,
         None, None, None,
     ));
@@ -886,6 +915,7 @@ fn main() -> Result<()> {
 
     // ── Worker loop ─────────────────────────────────────────────────────
     let signer = load_signer(&cfg.key_path)?;
+    init_compiled_cache();
     let is_daemon = mode == "daemon";
     let mut log_file = if is_daemon {
         let log_path = cfg.log_file_path();
