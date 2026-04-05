@@ -544,6 +544,226 @@ fn cmd_list(config_dir: &Path) {
     }
 }
 
+fn cmd_init(extra_args: &[String]) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let config_path = cwd.join("inlayer.config");
+
+    // Check if config already exists
+    if config_path.exists() {
+        eprintln!("⚠️  Config file already exists: {}", config_path.display());
+        eprintln!("   Delete it first or edit it directly.");
+        std::process::exit(1);
+    }
+
+    // Parse optional flags
+    let mut contract_id: Option<String> = None;
+    let mut account_id: Option<String> = None;
+    let mut network: Option<String> = None;
+    let mut force = false;
+
+    let mut i = 0;
+    while i < extra_args.len() {
+        match extra_args[i].as_str() {
+            "--contract" if i + 1 < extra_args.len() => {
+                contract_id = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            "--account" if i + 1 < extra_args.len() => {
+                account_id = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            "--network" if i + 1 < extra_args.len() => {
+                network = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            "--force" => {
+                force = true;
+                i += 1;
+            }
+            _ => {
+                eprintln!("Unknown flag: {}", extra_args[i]);
+                eprintln!("Usage: inlayer init [--contract <id>] [--account <id>] [--network <net>] [--force]");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    if force && config_path.exists() {
+        std::fs::remove_file(&config_path)?;
+        eprintln!("🗑️  Removed existing config file");
+    }
+
+    // 🔍 Auto-discover WASM projects recursively
+    eprintln!("🔍 Scanning for WASM projects...");
+    let mut wasm_projects = Vec::new();
+
+    fn scan_directory(dir: &Path, max_depth: usize, current_depth: usize, found: &mut Vec<String>) {
+        if current_depth > max_depth {
+            return;
+        }
+
+        let Ok(entries) = dir.read_dir() else { return };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+
+            // Skip hidden directories and common non-project dirs
+            if let Some(name) = path.file_name() {
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with('.') || name_str == "node_modules" || name_str == "target" {
+                    continue;
+                }
+            }
+
+            // Check if this directory contains WASM files
+            let release_path = path.join("target").join("wasm32-wasip2").join("release");
+            if release_path.exists() {
+                if let Ok(wasm_entries) = release_path.read_dir() {
+                    let has_wasm = wasm_entries.flatten().any(|w| {
+                        w.path().extension().map(|e| e == "wasm").unwrap_or(false)
+                    });
+                    if has_wasm {
+                        let rel_path = path.strip_prefix(env::current_dir().unwrap_or_else(|_| PathBuf::from("."))).unwrap_or(&path);
+                        found.push(format!("./{}", rel_path.display()));
+                        eprintln!("   ✅ Found project: {}", rel_path.display());
+                    }
+                }
+            }
+
+            // Recursively scan subdirectories
+            if path.is_dir() {
+                scan_directory(&path, max_depth, current_depth + 1, found);
+            }
+        }
+    }
+
+    scan_directory(&cwd, 3, 0, &mut wasm_projects);
+
+    // Try to auto-detect account from NEAR credentials
+    let detected_account = if account_id.is_none() {
+        // Try to find NEAR credential files
+        if let Some(home) = dirs::home_dir() {
+            for net in &["testnet", "mainnet"] {
+                let cred_dir = home.join(".near-credentials").join(net);
+                if cred_dir.exists() {
+                    if let Ok(entries) = cred_dir.read_dir() {
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.extension().map(|e| e == "json").unwrap_or(false) {
+                                let account_name = path.file_stem()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string();
+                                if !account_name.is_empty() {
+                                    eprintln!("✅ Detected account: {} ({})", account_name, net);
+                                    if account_id.is_none() {
+                                        account_id = Some(account_name.clone());
+                                    }
+                                    if network.is_none() {
+                                        network = Some(net.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        account_id
+    } else {
+        account_id
+    };
+
+    // Build search_paths - add discovered projects plus some defaults
+    let mut search_paths = Vec::new();
+
+    // Add discovered projects first
+    for project in &wasm_projects {
+        search_paths.push(project.clone());
+    }
+
+    // Add common paths if not already discovered
+    if !wasm_projects.iter().any(|p| p.contains("wasi-examples")) {
+        search_paths.push("./wasi-examples".to_string());
+    }
+
+    // Format search_paths for TOML
+    let search_paths_toml = if search_paths.is_empty() {
+        r#"search_paths = [
+    "./wasi-examples",
+    # Add your WASM project directories here
+]"#.to_string()
+    } else {
+        let paths: Vec<String> = search_paths.iter().map(|p| format!("    \"{}\",", p)).collect();
+        format!("search_paths = [\n{}]", paths.join("\n"))
+    };
+
+    // Build config with defaults
+    let contract_id = contract_id.unwrap_or_else(|| "outlayer.testnet".to_string());
+    let account_id = detected_account.unwrap_or_else(|| "your-account.testnet".to_string());
+    let network = network.unwrap_or_else(|| "testnet".to_string());
+    let _home = dirs::home_dir().unwrap_or_default();
+
+    let config_content = format!(
+        r#"# inlayer.config - OutLayer local worker configuration
+# Generated by: inlayer init
+#
+
+# NEAR contract to poll for execution requests
+contract_id = "{}"
+
+# Your NEAR account (will submit resolve transactions)
+account_id = "{}"
+
+# NEAR network
+network = "{}"
+
+# Path to your NEAR account key file
+# Run: near login --network {}
+key_path = "~/.near-credentials/{}/{}"
+
+# Directories to search for WASM files (auto-discovered)
+{}
+# You can add more paths manually:
+# search_paths = [
+#     "./my-wasm-project",
+#     "~/other-projects",
+# ]
+
+# How often to poll for new requests (seconds)
+poll_interval_secs = 5
+
+# Optional: Dashboard HTTP server (e.g. "127.0.0.1:8082")
+# dashboard_addr = "127.0.0.1:8082"
+"#,
+        contract_id,
+        account_id,
+        network,
+        network,
+        network,
+        account_id,
+        search_paths_toml
+    );
+
+    // Write config file
+    std::fs::write(&config_path, config_content)?;
+
+    eprintln!("✅ Created config file: {}", config_path.display());
+    eprintln!();
+    eprintln!("Next steps:");
+    eprintln!("1. Review and edit the config if needed:");
+    eprintln!("   nano {}", config_path.display());
+    eprintln!();
+    eprintln!("2. Make sure you have NEAR credentials:");
+    eprintln!("   near login --network {}", network);
+    eprintln!();
+    eprintln!("3. Start the daemon:");
+    eprintln!("   inlayer daemon --foreground");
+    eprintln!();
+
+    Ok(())
+}
+
 fn cmd_config(config_dir: &Path) {
     let cfg = Config::load(config_dir);
     println!("{}", toml::to_string_pretty(&cfg).unwrap_or_else(|e| format!("Error: {}", e)));
@@ -566,11 +786,14 @@ fn main() -> Result<()> {
     if args.len() < 2 || args[1] == "-h" || args[1] == "--help" || args[1] == "help" {
         eprintln!("inlayer v{} — OutLayer local WASM runner + request submission\n\n\
 Usage:\n\
+  inlayer init                                Create inlayer.config in current directory\n\
   inlayer run <wasm> <input> [--rpc <url>]    Run WASM locally\n\
   inlayer submit <input> [--wasm-url <url>]   Submit request to contract\n\
   inlayer status [--contract <id>]            Check pending requests\n\
   inlayer list                                List available WASMs\n\
   inlayer config                              Show current config\n\
+  inlayer daemon [--start|--stop|--status|--log|--daemon|--foreground|--dashboard <addr>]\n\
+                                           Start/manage daemon (polls contract & executes WASM)\n\
   inlayer version                             Show version\n\n\
 Config: ./inlayer.config or ~/.inlayer/inlayer.config", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
@@ -582,6 +805,9 @@ Config: ./inlayer.config or ~/.inlayer/inlayer.config", env!("CARGO_PKG_VERSION"
     }
 
     match args[1].as_str() {
+        "init" => {
+            cmd_init(&args[2..])?;
+        }
         "run" => {
             if args.len() < 3 {
                 eprintln!("Usage: inlayer run <wasm> <input> [--rpc <url>]");
@@ -610,6 +836,10 @@ Config: ./inlayer.config or ~/.inlayer/inlayer.config", env!("CARGO_PKG_VERSION"
         }
         "list" | "ls" => cmd_list(&config_dir),
         "config" => cmd_config(&config_dir),
+        "daemon" => {
+            // Delegate to daemon module
+            offchainvm_worker::daemon::run_daemon(&args[2..], &config_dir)?;
+        }
         cmd => { eprintln!("Unknown: {}. Run: inlayer help", cmd); std::process::exit(1); }
     }
     Ok(())

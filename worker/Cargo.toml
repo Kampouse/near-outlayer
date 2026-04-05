@@ -95,7 +95,3 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3.10"
-
-[[bin]]
-name = "layerd"
-path = "src/bin/layerd.rs"

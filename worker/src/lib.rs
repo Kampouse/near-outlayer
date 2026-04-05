@@ -15,3 +15,4 @@ pub mod outlayer_wallet;
 pub mod wasm_cache;
 pub mod compiled_cache;
 pub mod event_monitor;
+pub mod daemon;
