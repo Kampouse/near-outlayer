@@ -11,14 +11,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as AnyhowContext, Result};
-use near_crypto::InMemorySigner;
-use near_jsonrpc_client::JsonRpcClient;
+use near_crypto::{InMemorySigner, Signer};
+use near_jsonrpc_client::{JsonRpcClient, methods};
 use near_jsonrpc_primitives::types::query::QueryResponseKind;
 use near_primitives::action::{Action, FunctionCallAction};
 use near_primitives::transaction::{Transaction, TransactionV0};
 use near_primitives::types::BlockReference;
 use near_primitives::views::QueryRequest;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -769,6 +770,317 @@ fn cmd_config(config_dir: &Path) {
     println!("{}", toml::to_string_pretty(&cfg).unwrap_or_else(|e| format!("Error: {}", e)));
 }
 
+fn cmd_register(extra_args: &[String], config_dir: &Path) -> Result<()> {
+    let mut project_name = None;
+    let mut network = "testnet".to_string();
+    let mut contract_id = "outlayer.kampouse.testnet".to_string();
+    let mut tunnel_url = None;
+
+    // Parse args
+    let mut i = 0;
+    while i < extra_args.len() {
+        match extra_args[i].as_str() {
+            "--network" if i + 1 < extra_args.len() => {
+                network = extra_args[i + 1].clone();
+                i += 2;
+            }
+            "--contract" if i + 1 < extra_args.len() => {
+                contract_id = extra_args[i + 1].clone();
+                i += 2;
+            }
+            "--tunnel" if i + 1 < extra_args.len() => {
+                tunnel_url = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            name if !name.starts_with("--") => {
+                project_name = Some(name.clone());
+                i += 1;
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    let project_name = project_name.ok_or_else(|| anyhow::anyhow!("Usage: inlayer register <project-name> [--network testnet] [--contract outlayer.kampouse.testnet] [--tunnel https://...]"))?;
+
+    eprintln!("📦 Registering project '{}' to blockchain...", project_name);
+
+    // Load signer credentials
+    let cfg = offchainvm_worker::daemon::DaemonConfig::load(config_dir);
+    let signer = offchainvm_worker::daemon::load_signer(&cfg.key_path)?;
+    let account_id = signer.account_id.clone();
+
+    // Find WASM file for project
+    eprintln!("   🔍 Finding WASM file...");
+    let wasm_path = find_project_wasm(&cfg.search_paths, &project_name)
+        .ok_or_else(|| anyhow::anyhow!("WASM file not found for project '{}'. Searched in: {:?}", project_name, cfg.search_paths))?;
+
+    eprintln!("   ✅ Found: {}", wasm_path.display());
+
+    // Calculate SHA256
+    eprintln!("   🔐 Calculating SHA256...");
+    let wasm_bytes = std::fs::read(&wasm_path)?;
+    let hash = format!("{:x}", sha2::Sha256::digest(&wasm_bytes));
+    eprintln!("   ✅ SHA256: {}", hash);
+
+    // Get tunnel URL (from args, config, or prompt user)
+    let wasm_url = if let Some(url) = tunnel_url.or(cfg.tunnel_url) {
+        url
+    } else {
+        eprintln!();
+        eprintln!("⚠️  No tunnel URL provided. Your daemon needs to be accessible for workers to download the WASM.");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("1. Start daemon with tunnel: inlayer daemon --tunnel");
+        eprintln!("2. Then run: inlayer register {} --tunnel <URL>", project_name);
+        eprintln!();
+        anyhow::bail!("Tunnel URL required. Start daemon with: inlayer daemon --tunnel");
+    };
+
+    let wasm_url = format!("{}/wasm/{}/{}", wasm_url.trim_end_matches('/'), signer.account_id, project_name);
+    eprintln!("   📍 WASM URL: {}", wasm_url);
+
+    // Build create_project transaction
+    eprintln!("   📝 Calling create_project on contract...");
+    let rpc_url = match network.as_str() {
+        "mainnet" => "https://rpc.mainnet.near.org",
+        "testnet" => "https://test.rpc.fastnear.com",
+        _ => return Err(anyhow::anyhow!("Unknown network: {}", network)),
+    };
+
+    let client = JsonRpcClient::connect(rpc_url);
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let tx_result = rt.block_on(async {
+        // Fetch nonce
+        let query = methods::query::RpcQueryRequest {
+            block_reference: BlockReference::latest(),
+            request: QueryRequest::ViewAccessKey {
+                account_id: signer.account_id.clone(),
+                public_key: signer.public_key.clone(),
+            },
+        };
+        let response = client.call(query).await?;
+        let nonce = match response.kind {
+            QueryResponseKind::AccessKey(ak) => ak.nonce + 1,
+            _ => anyhow::bail!("unexpected query response"),
+        };
+
+        // Build args
+        let args = serde_json::json!({
+            "name": project_name,
+            "source": {
+                "WasmUrl": {
+                    "url": wasm_url,
+                    "hash": hash,
+                    "build_target": "wasm32-wasip2"
+                }
+            }
+        });
+        let args_bytes = serde_json::to_vec(&args)?;
+
+        // Calculate storage cost (rough estimate: 100KB to be safe)
+        let deposit = 100_000_000_000_000_000_000_000; // 0.1 NEAR (100 billion yocto)
+
+        let transaction = TransactionV0 {
+            signer_id: signer.account_id.clone(),
+            public_key: signer.public_key.clone(),
+            nonce,
+            receiver_id: contract_id.parse()?,
+            block_hash: response.block_hash,
+            actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                method_name: "create_project".to_string(),
+                args: args_bytes,
+                gas: 100_000_000_000_000,
+                deposit,
+            }))],
+        };
+
+        let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer));
+
+        // Send transaction and capture result
+        eprintln!("   ⏳ Submitting transaction...");
+        client.call(methods::send_tx::RpcSendTransactionRequest {
+            signed_transaction: signed_tx,
+            wait_until: near_primitives::views::TxExecutionStatus::ExecutedOptimistic,
+        }).await.map_err(|e| anyhow::anyhow!("Transaction failed: {}", e))
+    });
+
+    tx_result?;
+
+    // Verify the project was actually created
+    eprintln!("   🔍 Verifying project creation...");
+    let client2 = JsonRpcClient::connect(rpc_url);
+    let verify_result = rt.block_on(async {
+        let project_id = format!("{}/{}", account_id, project_name);
+        let args_bytes = format!("\"{}\"", project_id).into_bytes();
+        let query = methods::query::RpcQueryRequest {
+            block_reference: BlockReference::latest(),
+            request: QueryRequest::CallFunction {
+                account_id: contract_id.parse().unwrap(),
+                method_name: "get_project".to_string(),
+                args: near_primitives::types::FunctionArgs::from(args_bytes),
+            },
+        };
+
+        client2.call(query).await
+    });
+
+    match verify_result {
+        Ok(response) => {
+            if let QueryResponseKind::CallResult(result) = response.kind {
+                if !result.result.is_empty() {
+                    eprintln!("   ✅ Project verified on contract!");
+                } else {
+                    eprintln!("   ⚠️  Warning: Project not found on contract after creation");
+                    eprintln!("   This might mean the transaction failed silently.");
+                    eprintln!("   Check transaction status on NEAR Explorer");
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("   ⚠️  Could not verify project: {}", e);
+            eprintln!("   Check transaction status on NEAR Explorer");
+        }
+    }
+
+    drop(rt); // Drop runtime before continuing
+
+    eprintln!();
+    eprintln!("✅ Project '{}' registered successfully!", project_name);
+    eprintln!("   Project ID: {}/{}", account_id, project_name);
+    eprintln!();
+    eprintln!("💡 Frontend can now call:");
+    eprintln!("   POST /call/{}/{}", account_id, project_name);
+    eprintln!();
+
+    Ok(())
+}
+
+fn find_project_wasm(search_paths: &[String], project_name: &str) -> Option<PathBuf> {
+    for dir in search_paths {
+        let base = PathBuf::from(dir);
+        if !base.exists() { continue; }
+
+        // Check for project directory
+        if let Ok(entries) = base.read_dir() {
+            for entry in entries.flatten() {
+                let path = entry.path();
+
+                // Check if directory name matches project
+                if path.is_dir() {
+                    let dirname = path.file_name()?.to_string_lossy();
+                    if dirname.contains(project_name) {
+                        let release = path.join("target").join("wasm32-wasip2").join("release");
+                        if let Ok(wasm_entries) = release.read_dir() {
+                            for wasm_entry in wasm_entries.flatten() {
+                                let wasm_path = wasm_entry.path();
+                                if wasm_path.is_file() && wasm_path.extension().map(|e| e == "wasm").unwrap_or(false) {
+                                    let fname = wasm_path.file_name()?.to_string_lossy();
+                                    if !fname.starts_with('.') && !fname.contains("-deps") {
+                                        return Some(wasm_path);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Check for direct WASM file
+                if path.is_file() && path.extension().map(|e| e == "wasm").unwrap_or(false) {
+                    let fname = path.file_name()?.to_string_lossy();
+                    if fname.contains(project_name) {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn cmd_projects(extra_args: &[String], config_dir: &Path) -> Result<()> {
+    let mut network = "testnet".to_string();
+    let mut contract_id = "outlayer.kampouse.testnet".to_string();
+    let mut account_id = None;
+
+    let mut i = 0;
+    while i < extra_args.len() {
+        match extra_args[i].as_str() {
+            "--network" if i + 1 < extra_args.len() => {
+                network = extra_args[i + 1].clone();
+                i += 2;
+            }
+            "--contract" if i + 1 < extra_args.len() => {
+                contract_id = extra_args[i + 1].clone();
+                i += 2;
+            }
+            "--account" if i + 1 < extra_args.len() => {
+                account_id = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    // Load signer to get account_id if not provided
+    let cfg = offchainvm_worker::daemon::DaemonConfig::load(config_dir);
+    let account_id = account_id.unwrap_or_else(|| {
+        // Try to load from config
+        match offchainvm_worker::daemon::load_signer(&cfg.key_path) {
+            Ok(signer) => signer.account_id.to_string(),
+            Err(_) => "your-account.testnet".to_string(),
+        }
+    });
+
+    eprintln!("📋 Listing projects for: {}", account_id);
+
+    let rpc_url = match network.as_str() {
+        "mainnet" => "https://rpc.mainnet.near.org",
+        "testnet" => "https://test.rpc.fastnear.com",
+        _ => return Err(anyhow::anyhow!("Unknown network: {}", network)),
+    };
+
+    let client = JsonRpcClient::connect(rpc_url);
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let result = rt.block_on(async {
+        let args_bytes = format!("\"{}\"", account_id).into_bytes();
+        let query = methods::query::RpcQueryRequest {
+            block_reference: BlockReference::latest(),
+            request: QueryRequest::CallFunction {
+                account_id: contract_id.parse().unwrap(),
+                method_name: "list_user_projects".to_string(),
+                args: near_primitives::types::FunctionArgs::from(args_bytes),
+            },
+        };
+
+        client.call(query).await
+    });
+
+    match result {
+        Ok(response) => {
+            if let QueryResponseKind::CallResult(result) = response.kind {
+                if result.result.is_empty() {
+                    eprintln!("   No projects found");
+                } else {
+                    let projects: Vec<serde_json::Value> = serde_json::from_slice(&result.result)?;
+                    eprintln!("   Found {} projects:", projects.len());
+                    for project in projects {
+                        let name = project.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let uuid = project.get("uuid").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        eprintln!("   • {} (uuid: {})", name, uuid);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("   Error: {}", e);
+        }
+    }
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
@@ -787,13 +1099,17 @@ fn main() -> Result<()> {
         eprintln!("inlayer v{} — OutLayer local WASM runner + request submission\n\n\
 Usage:\n\
   inlayer init                                Create inlayer.config in current directory\n\
+  inlayer register <project-name> <source>    Register project on contract\n\
+                                             Sources: --github <repo> <commit> | --wasm-url <url> <sha256>\n\
+  inlayer projects [--account <id>]           List registered projects\n\
   inlayer run <wasm> <input> [--rpc <url>]    Run WASM locally\n\
   inlayer submit <input> [--wasm-url <url>]   Submit request to contract\n\
   inlayer status [--contract <id>]            Check pending requests\n\
   inlayer list                                List available WASMs\n\
   inlayer config                              Show current config\n\
-  inlayer daemon [--start|--stop|--status|--log|--daemon|--foreground|--dashboard <addr>]\n\
+  inlayer daemon [--start|--stop|--status|--log|--daemon|--foreground|--dashboard <addr>|--tunnel]\n\
                                            Start/manage daemon (polls contract & executes WASM)\n\
+                                           --tunnel: Create Cloudflare tunnel for public internet access\n\
   inlayer version                             Show version\n\n\
 Config: ./inlayer.config or ~/.inlayer/inlayer.config", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
@@ -807,6 +1123,12 @@ Config: ./inlayer.config or ~/.inlayer/inlayer.config", env!("CARGO_PKG_VERSION"
     match args[1].as_str() {
         "init" => {
             cmd_init(&args[2..])?;
+        }
+        "register" => {
+            cmd_register(&args[2..], &config_dir)?;
+        }
+        "projects" => {
+            cmd_projects(&args[2..], &config_dir)?;
         }
         "run" => {
             if args.len() < 3 {

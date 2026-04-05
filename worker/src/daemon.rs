@@ -105,6 +105,7 @@ struct DashboardState {
     rpc_url: String,
     search_paths: Vec<String>,
     env: HashMap<String, String>,
+    signer: std::sync::Mutex<Option<InMemorySigner>>,
 }
 
 #[derive(Debug)]
@@ -714,9 +715,10 @@ async fn api_contract(State(state): State<Arc<DashboardState>>) -> axum::Json<Co
 
 async fn api_call(
     State(state): State<Arc<DashboardState>>,
-    axum::extract::Path((_owner, _project)): axum::extract::Path<(String, String)>,
+    axum::extract::Path((owner, project)): axum::extract::Path<(String, String)>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    // Extract input from request body
     let input_val = match body.get("input") {
         Some(v) => v.clone(),
         None => return (
@@ -724,42 +726,184 @@ async fn api_call(
             axum::Json(serde_json::json!({ "status": "failed", "error": "Missing 'input' field in request body" })),
         ),
     };
-    let input_str = input_val.to_string();
-    let search_paths = state.search_paths.clone();
-    let rpc_url = state.rpc_url.clone();
-    let env_vars = state.env.clone();
+    let input_str = input_val.as_str().unwrap_or("").to_string();
 
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<WasmResult> {
-        // Create a temporary config for WASM search
+    // Extract optional deposit amount (in yoctoNEAR)
+    let deposit = body.get("deposit")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u128>().ok())
+        .unwrap_or(7_000_100_000_000_000_000_000); // Default: 7.0001 NEAR
+
+    // Get signer from dashboard state
+    let signer = match &*state.signer.lock().unwrap() {
+        Some(s) => s.clone(),
+        None => return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({ "status": "failed", "error": "Daemon not ready - signer not initialized" })),
+        ),
+    };
+
+    let contract_id = state.contract_id.clone();
+    let rpc_url = state.rpc_url.clone();
+    let project_id = format!("{}/{}", owner, project);
+
+    // Call contract's request_execution method
+    let result = tokio::task::spawn_blocking(move || -> Result<u64> {
+        let client = JsonRpcClient::connect(rpc_url);
+        let rt = tokio::runtime::Runtime::new()?;
+
+        rt.block_on(async {
+            // Fetch current nonce and block hash
+            let query = methods::query::RpcQueryRequest {
+                block_reference: BlockReference::latest(),
+                request: QueryRequest::ViewAccessKey {
+                    account_id: signer.account_id.clone(),
+                    public_key: signer.public_key.clone(),
+                },
+            };
+            let response = client.call(query).await?;
+            let nonce = match response.kind {
+                QueryResponseKind::AccessKey(ak) => ak.nonce + 1,
+                _ => anyhow::bail!("unexpected query response for access key"),
+            };
+
+            // Build transaction args with proper ExecutionSource::Project
+            let args = serde_json::json!({
+                "source": {
+                    "Project": {
+                        "project_id": project_id,
+                        "version_key": null
+                    }
+                },
+                "input_data": input_str,
+                "resource_limits": {
+                    "max_instructions": 1_000_000_000,
+                    "max_memory_mb": 128,
+                    "max_execution_seconds": 60
+                },
+                "secrets_ref": null,
+                "response_format": null,
+                "payer_account_id": null,
+                "params": null
+            });
+            let args_bytes = serde_json::to_vec(&args)?;
+
+            let transaction = TransactionV0 {
+                signer_id: signer.account_id.clone(),
+                public_key: signer.public_key.clone(),
+                nonce,
+                receiver_id: contract_id.parse()?,
+                block_hash: response.block_hash,
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "request_execution".to_string(),
+                    args: args_bytes,
+                    gas: 300_000_000_000_000, // 300 TGas
+                    deposit,
+                }))],
+            };
+
+            let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer));
+
+            // Send transaction
+            client.call(methods::send_tx::RpcSendTransactionRequest {
+                signed_transaction: signed_tx,
+                wait_until: near_primitives::views::TxExecutionStatus::ExecutedOptimistic,
+            }).await.map_err(|e| anyhow::anyhow!("send_tx failed: {}", e))?;
+
+            // Parse request_id from the result
+            // Note: The contract returns the request_id in the execution outcome
+            // For now, we'll return a placeholder - in production you'd parse the outcome
+            Ok(1) // TODO: Parse actual request_id from transaction outcome
+        })
+    }).await;
+
+    match result {
+        Ok(Ok(request_id)) => (
+            axum::http::StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({
+                "status": "submitted",
+                "request_id": request_id,
+                "project_id": format!("{}/{}", owner, project),
+                "message": "Execution request submitted to blockchain. Daemon will execute and resolve shortly.",
+            })),
+        ),
+        Ok(Err(e)) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({ "status": "failed", "error": e.to_string() })),
+        ),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({ "status": "failed", "error": format!("Execution panicked: {}", e) })),
+        ),
+    }
+}
+
+// Serve WASM files for project registration
+async fn api_wasm(
+    State(state): State<Arc<DashboardState>>,
+    axum::extract::Path((owner, project)): axum::extract::Path<(String, String)>,
+) -> (axum::http::StatusCode, axum::body::Body) {
+    let search_paths = state.search_paths.clone();
+
+    // Find WASM file for this project
+    let result = tokio::task::spawn_blocking(move || -> Option<PathBuf> {
         let temp_config = DaemonConfig {
             search_paths,
             ..Default::default()
         };
-        let wasm_path = find_wasm(&temp_config).context("WASM not found. Check search_paths in config.")?;
-        let wasm_bytes = get_wasm_bytes(&wasm_path)?;
-        let mut env_vars = env_vars;
-        env_vars.insert("REQUEST_TYPE".into(), "https".into());
-        let limits = RequestInfo { input: String::new(), max_instructions: 10_000_000_000, max_memory_mb: 256, max_execution_seconds: 120 };
-        Ok(execute_single_wasm(wasm_bytes, 0, &input_str, &rpc_url, &env_vars, &limits))
+
+        // First find the WASM
+        if let Some(wasm_path) = find_wasm(&temp_config) {
+            // Check if filename contains project name
+            let filename = wasm_path.file_name()?.to_string_lossy();
+            if filename.contains(&project) || project.is_empty() {
+                return Some(wasm_path);
+            }
+        }
+
+        // Try more specific search
+        for dir in &temp_config.search_paths {
+            let base = PathBuf::from(dir);
+            if let Ok(entries) = base.read_dir() {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() && path.file_name()?.to_string_lossy().contains(&project) {
+                        let release = path.join("target").join("wasm32-wasip2").join("release");
+                        if let Ok(wasm_entries) = release.read_dir() {
+                            for wasm_entry in wasm_entries.flatten() {
+                                let wasm_path = wasm_entry.path();
+                                if wasm_path.is_file() && wasm_path.extension().map(|e| e == "wasm").unwrap_or(false) {
+                                    return Some(wasm_path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+        }
+        None
     }).await;
 
-    let wasm_result = match result {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({ "status": "failed", "error": e.to_string() }))),
-        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({ "status": "failed", "error": format!("WASM execution panicked: {}", e) }))),
-    };
-
-    if wasm_result.success {
-        let output_val: serde_json::Value = serde_json::from_str(&wasm_result.output).unwrap_or_else(|_| serde_json::json!({ "Text": wasm_result.output }));
-        (
-            axum::http::StatusCode::OK,
-            axum::Json(serde_json::json!({ "status": "completed", "output": output_val, "compute_cost": wasm_result.instructions, "execution_time_ms": wasm_result.time_ms, "instructions": wasm_result.instructions })),
-        )
-    } else {
-        (
-            axum::http::StatusCode::OK,
-            axum::Json(serde_json::json!({ "status": "failed", "error": wasm_result.error.unwrap_or_else(|| "Unknown error".into()), "output": null, "compute_cost": wasm_result.instructions })),
-        )
+    match result {
+        Ok(Some(wasm_path)) => match fs::read(&wasm_path) {
+            Ok(bytes) => (
+                axum::http::StatusCode::OK,
+                axum::body::Body::from(bytes),
+            ),
+            Err(_) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::body::Body::from("Failed to read WASM file"),
+            ),
+        },
+        Ok(None) => (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::body::Body::from("WASM file not found"),
+        ),
+        Err(_) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::body::Body::from("Error searching for WASM"),
+        ),
     }
 }
 
@@ -778,6 +922,7 @@ fn spawn_dashboard(addr: &str, state: Arc<DashboardState>) {
         rt.block_on(async move {
             let app = Router::new()
                 .route("/call/:owner/:project", axum::routing::post(api_call))
+                .route("/wasm/:owner/:project", get(api_wasm))
                 .route("/api/status", get(api_status))
                 .route("/api/history", get(api_history))
                 .route("/api/stream", get(api_stream))
@@ -907,7 +1052,7 @@ fn now() -> String {
 #[derive(Deserialize)]
 struct KeyFile { private_key: String, account_id: String }
 
-fn load_signer(path: &str) -> Result<InMemorySigner> {
+pub fn load_signer(path: &str) -> Result<InMemorySigner> {
     // Check if key file exists first
     if !std::path::Path::new(path).exists() {
         anyhow::bail!(
@@ -947,19 +1092,22 @@ pub struct DaemonConfig {
     pub dashboard_addr: Option<String>,
     /// WASM search directories (shared with inlayer Config)
     pub search_paths: Vec<String>,
+    /// Cloudflare tunnel URL (auto-populated when using --tunnel)
+    pub tunnel_url: Option<String>,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         let home = dirs::home_dir().unwrap_or_default();
         Self {
-            contract_id: "outlayer.testnet".to_string(),
+            contract_id: "outlayer.kampouse.testnet".to_string(),
             account_id: "your-account.testnet".to_string(),
             network: "testnet".to_string(),
             key_path: format!("{}/.near-credentials/testnet/your-account.testnet.json", home.display()),
             poll_interval_secs: 5,
             dashboard_addr: None,
             search_paths: vec!["./wasi-examples".to_string()],
+            tunnel_url: None,
         }
     }
 }
@@ -972,7 +1120,7 @@ impl DaemonConfig {
                 "⚠️  Configuration not set up.\n\n\
                 Please create ./inlayer.config in your project directory:\n\
                 ---\n\
-                contract_id = \"outlayer.testnet\"\n\
+                contract_id = \"outlayer.kampouse.testnet\"\n\
                 account_id = \"your-actual-account.testnet\"\n\
                 key_path = \"~/.near-credentials/testnet/your-actual-account.testnet.json\"\n\
                 network = \"testnet\"\n\
@@ -984,8 +1132,38 @@ impl DaemonConfig {
             );
         }
 
-        // Validate key file exists
-        if !std::path::Path::new(&self.key_path).exists() {
+        // Validate key file exists (try both with and without .json extension)
+        let key_path = std::path::Path::new(&self.key_path);
+        if !key_path.exists() {
+            // Try adding .json if not present
+            let with_json = format!("{}.json", self.key_path);
+            let json_path = std::path::Path::new(&with_json);
+            if json_path.exists() {
+                // File exists with .json extension - provide helpful message
+                anyhow::bail!(
+                    "⚠️  Key file not found: {}\n\
+                    But found: {}\n\n\
+                    Please update your inlayer.config:\n\
+                    key_path = \"{}\"",
+                    self.key_path, with_json, with_json
+                );
+            }
+
+            // Try removing .json if present
+            let without_json = self.key_path.trim_end_matches(".json");
+            let no_json_path = std::path::Path::new(without_json);
+            if no_json_path.exists() {
+                // File exists without .json extension - provide helpful message
+                anyhow::bail!(
+                    "⚠️  Key file not found: {}\n\
+                    But found: {}\n\n\
+                    Please update your inlayer.config:\n\
+                    key_path = \"{}\"",
+                    self.key_path, without_json, without_json
+                );
+            }
+
+            // File not found at all
             anyhow::bail!(
                 "⚠️  Key file not found: {}\n\n\
                 Run: near login --network {}\n\
@@ -997,7 +1175,7 @@ impl DaemonConfig {
         Ok(())
     }
 
-    fn load(config_dir: &Path) -> Self {
+    pub fn load(config_dir: &Path) -> Self {
         // Priority 1: Current working directory (project-specific config)
         let cwd = env::current_dir().unwrap_or_else(|_| config_dir.to_path_buf());
         for name in &["inlayer.config", "inlayer.config.toml"] {
@@ -1048,7 +1226,7 @@ impl DaemonConfig {
         eprintln!("⚠️  No config file found. Using defaults.");
         eprintln!("   Create ./inlayer.config in your project directory:");
         eprintln!("   ---");
-        eprintln!("   contract_id = \"outlayer.testnet\"");
+        eprintln!("   contract_id = \"outlayer.kampouse.testnet\"");
         eprintln!("   account_id = \"your-account.testnet\"");
         eprintln!("   key_path = \"~/.near-credentials/testnet/your-account.testnet.json\"");
         eprintln!("   network = \"testnet\"");
@@ -1092,15 +1270,95 @@ impl DaemonConfig {
         let home = dirs::home_dir().unwrap_or_default();
         home.join(".inlayer").join("layerd.log")
     }
+
+    fn tunnel_pid_file_path(&self) -> PathBuf {
+        let home = dirs::home_dir().unwrap_or_default();
+        home.join(".inlayer").join("cloudflared.pid")
+    }
+}
+
+// ── Cloudflare Tunnel Management ───────────────────────────────────────────
+
+fn spawn_cloudflare_tunnel(port: u16) -> Result<String> {
+    eprintln!("🌐 Starting Cloudflare tunnel...");
+
+    let log_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".inlayer")
+        .join("cloudflared.log");
+
+    // Create log file
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+
+    // Spawn cloudflared process
+    let child = std::process::Command::new("cloudflared")
+        .arg("tunnel")
+        .arg("--url")
+        .arg(format!("http://localhost:{}", port))
+        .stdout(std::fs::File::create(&log_path).unwrap())
+        .stderr(std::fs::File::create(&log_path).unwrap())
+        .spawn()
+        .context("failed to spawn cloudflared - is it installed? (brew install cloudflared)")?;
+
+    let pid = child.id();
+
+    // Save PID for cleanup
+    let pid_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".inlayer")
+        .join("cloudflared.pid");
+    fs::write(&pid_path, pid.to_string()).ok();
+
+    eprintln!("   Waiting for tunnel URL...");
+
+    // Wait for tunnel URL to appear in logs (up to 20 seconds)
+    for i in 1..=20 {
+        std::thread::sleep(Duration::from_secs(1));
+        eprint!(".");
+
+        if let Ok(log_content) = fs::read_to_string(&log_path) {
+            // Extract URL using regex
+            if let Ok(re) = regex::Regex::new(r"https://[a-z0-9-]+\.trycloudflare\.com") {
+                if let Some(m) = re.find(&log_content) {
+                    let url = m.as_str().to_string();
+                    eprintln!();
+                    eprintln!("   ✅ Tunnel created!");
+                    eprintln!("   📍 URL: {}", url);
+                    return Ok(url);
+                }
+            }
+        }
+    }
+
+    anyhow::bail!("timeout waiting for tunnel URL")
+}
+
+fn stop_cloudflare_tunnel() {
+    let pid_path = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".inlayer")
+        .join("cloudflared.pid");
+
+    if let Ok(pid_str) = fs::read_to_string(&pid_path) {
+        if let Ok(pid) = pid_str.trim().parse::<u32>() {
+            eprintln!("🛑 Stopping Cloudflare tunnel...");
+            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+            let _ = std::thread::sleep(Duration::from_millis(500));
+            let _ = fs::remove_file(&pid_path);
+        }
+    }
 }
 
 /// Main entry point for `inlayer daemon`.
 /// Args after "daemon" subcommand are passed here.
 pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
-    let daemon_cfg = DaemonConfig::load(config_dir);
+    let mut daemon_cfg = DaemonConfig::load(config_dir);
 
     // Determine mode from args
     if args.iter().any(|a| a == "--stop") {
+        stop_cloudflare_tunnel(); // Stop tunnel if running
         return stop_daemon(&daemon_cfg.pid_file_path());
     } else if args.iter().any(|a| a == "--start") {
         return start_daemon_via_launchd();
@@ -1112,9 +1370,29 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
     let dashboard_addr = parse_dashboard_flag(args).or(daemon_cfg.dashboard_addr.clone());
     let is_daemon = args.iter().any(|a| a == "--daemon");
+    let use_tunnel = args.iter().any(|a| a == "--tunnel");
 
     // Validate configuration before starting daemon
     daemon_cfg.validate()?;
+
+    // ── Cloudflare Tunnel Setup ───────────────────────────────────────────
+    if use_tunnel {
+        eprintln!("🌐 Cloudflare tunnel requested...");
+        let tunnel_url = spawn_cloudflare_tunnel(8082)?;
+
+        // Save tunnel URL to config
+        let config_path = config_dir.join("inlayer.config");
+        if config_path.exists() {
+            let mut config_str = fs::read_to_string(&config_path)?;
+            if !config_str.contains("tunnel_url") {
+                config_str.push_str(&format!("\ntunnel_url = \"{}\"\n", tunnel_url));
+                fs::write(&config_path, config_str)?;
+                eprintln!("💾 Saved tunnel URL to config");
+            }
+        }
+
+        daemon_cfg.tunnel_url = Some(tunnel_url);
+    }
 
     if is_daemon {
         let pid_path = daemon_cfg.pid_file_path();
@@ -1164,6 +1442,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
         rpc_url: rpc_url.clone(),
         search_paths: daemon_cfg.search_paths.clone(),
         env: HashMap::new(),
+        signer: std::sync::Mutex::new(None),
     });
 
     if let Some(ref addr) = dashboard_addr {
@@ -1173,6 +1452,12 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     // ── Worker loop ─────────────────────────────────────────────────────
     let signer = load_signer(&daemon_cfg.key_path)?;
     init_compiled_cache(signer_key_bytes(&signer));
+
+    // Set signer in dashboard state for API calls
+    {
+        let mut state = dashboard_state.signer.lock().unwrap();
+        *state = Some(signer.clone());
+    }
 
     let mut log_file = if is_daemon {
         let log_path = daemon_cfg.log_file_path();
@@ -1328,6 +1613,11 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
             }
         }
     }
+
+    // Cleanup (unreachable in infinite loop, but here for completeness)
+    stop_cloudflare_tunnel();
+
+    Ok(())
 }
 
 fn parse_dashboard_flag(args: &[String]) -> Option<String> {

@@ -1,0 +1,6 @@
+contract_id = "outlayer.testnet"
+account_id = "kampouse.testnet"  
+key_path = "~/.near-credentials/testnet/kampouse.testnet.json"
+network = "testnet"
+search_paths = ["./wasi-examples"]
+poll_interval_secs = 5
