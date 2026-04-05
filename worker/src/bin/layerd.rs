@@ -148,11 +148,38 @@ impl Config {
             for name in &["inlayer.config", "inlayer.config.toml", "layerd.config", "layerd.config.toml"] {
                 let path = PathBuf::from(dir).join(name);
                 if let Ok(s) = std::fs::read_to_string(&path) {
-                    if let Ok(cfg) = toml::from_str(&s) { return cfg; }
+                    if let Ok(mut cfg) = toml::from_str::<Config>(&s) {
+                        cfg.expand_tildes();
+                        return cfg;
+                    }
                 }
             }
         }
         Config::default()
+    }
+
+    /// Expand ~ in paths to home directory
+    fn expand_tildes(&mut self) {
+        let home = dirs::home_dir().unwrap_or_default();
+        let home_str = home.display().to_string();
+        for dir in &mut self.wasm_search_dirs {
+            if dir.starts_with("~/") {
+                *dir = format!("{}/{}", home_str, &dir[2..]);
+            }
+        }
+        if self.key_path.starts_with("~/") {
+            self.key_path = format!("{}/{}", home_str, &self.key_path[2..]);
+        }
+        if let Some(ref mut p) = self.log_file {
+            if p.starts_with("~/") {
+                *p = format!("{}/{}", home_str, &p[2..]);
+            }
+        }
+        if let Some(ref mut p) = self.pid_file {
+            if p.starts_with("~/") {
+                *p = format!("{}/{}", home_str, &p[2..]);
+            }
+        }
     }
 
     fn pid_file_path(&self) -> PathBuf {
