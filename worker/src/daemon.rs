@@ -222,6 +222,7 @@ impl Rpc {
                     let parsed = result.and_then(|bytes| {
                         if bytes.is_empty() { anyhow::bail!("request {} not found", req_id); }
                         let req: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        eprintln!("   📋 Raw request #{}: {}", req_id, &serde_json::to_string(&req).unwrap_or_default()[..200.min(serde_json::to_string(&req).unwrap_or_default().len())]);
                         let input_raw = req.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
                         let input_str = if input_raw.is_empty() {
                             String::new()
@@ -232,11 +233,17 @@ impl Rpc {
                             }
                         };
                         let limits = req.get("resource_limits");
+
+                        // Parse source from contract request
+                        let source = parse_source(&req);
+                        eprintln!("   📦 Parsed source: {:?}", source);
+
                         Ok(RequestInfo {
                             input: input_str,
                             max_instructions: limits.and_then(|l| l.get("max_instructions")).and_then(|v| v.as_u64()).unwrap_or(10_000_000_000),
                             max_memory_mb: limits.and_then(|l| l.get("max_memory_mb")).and_then(|v| v.as_u64()).unwrap_or(256) as u32,
                             max_execution_seconds: limits.and_then(|l| l.get("max_execution_seconds")).and_then(|v| v.as_u64()).unwrap_or(60),
+                            source,
                         })
                     });
                     (req_id, parsed)
@@ -263,6 +270,217 @@ impl Rpc {
 
 // ── Contract calls ──────────────────────────────────────────────────────────
 
+/// Parse the execution source from contract request JSON.
+/// Handles WasmUrl, Project, and GitHub sources.
+fn parse_source(req: &serde_json::Value) -> ParsedSource {
+    // Try resolved_source first (resolved by contract), then execution_source, then code_source
+    let source = match req.get("resolved_source") {
+        Some(s) => s,
+        None => match req.get("execution_source") {
+            Some(s) => s,
+            None => match req.get("code_source") {
+                Some(s) => s,
+                None => match req.get("source") {
+                    Some(s) => s,
+                    None => return ParsedSource::Unknown,
+                },
+            },
+        },
+    };
+
+    // WasmUrl: { "WasmUrl": { "url": "...", "hash": "..." } }
+    if let Some(wu) = source.get("WasmUrl") {
+        let url = wu.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let hash = wu.get("hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !url.is_empty() {
+            return ParsedSource::WasmUrl { url, hash };
+        }
+    }
+
+    // Project: { "Project": { "project_id": "owner/name" } }
+    if let Some(proj) = source.get("Project") {
+        let project_id = proj.get("project_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if !project_id.is_empty() {
+            return ParsedSource::Project { project_id };
+        }
+    }
+
+    // GitHub: { "GitHub": { "repo": "...", "commit": "..." } }
+    // For now we can't compile from GitHub locally, fall through
+    if source.get("GitHub").is_some() {
+        return ParsedSource::Unknown;
+    }
+
+    ParsedSource::Unknown
+}
+
+/// Resolve WASM bytes for a given request source.
+/// - WasmUrl: download and cache locally
+/// - Project: find by project_id in search paths
+/// - Unknown: fall back to default WASM discovery
+fn resolve_wasm(source: &ParsedSource, config: &DaemonConfig) -> Option<Vec<u8>> {
+    match source {
+        ParsedSource::WasmUrl { url, hash } => {
+            resolve_wasm_from_url(url, hash)
+        }
+        ParsedSource::Project { project_id } => {
+            resolve_wasm_from_project(project_id, config)
+        }
+        ParsedSource::Unknown => {
+            // Fall back to default WASM discovery
+            let path = find_wasm(config)?;
+            fs::read(&path).ok()
+        }
+    }
+}
+
+/// Find WASM locally by URL filename, then fall back to download.
+fn resolve_wasm_from_url(url: &str, _hash: &str) -> Option<Vec<u8>> {
+    // Extract filename from URL (e.g. "nostr-identity-zkp-tee-wasip2.wasm")
+    let filename = url.rsplit('/').next().unwrap_or("");
+
+    // Search local paths first
+    if !filename.is_empty() {
+        let home = dirs::home_dir().unwrap_or_default();
+        let search_dirs = vec![
+            home.join(".openclaw/workspace"),
+            home.join(".openclaw/workspace/nostr-identity"),
+            PathBuf::from("."),
+        ];
+        for dir in &search_dirs {
+            let candidate = dir.join(filename);
+            if candidate.exists() {
+                eprintln!("   📦 Local WASM: {}", candidate.display());
+                return fs::read(&candidate).ok();
+            }
+            // Also check for wasip2 variant
+            if !filename.contains("wasip2") {
+                let p2_name = filename.replace(".wasm", "-wasip2.wasm");
+                let candidate2 = dir.join(&p2_name);
+                if candidate2.exists() {
+                    eprintln!("   📦 Local WASM: {}", candidate2.display());
+                    return fs::read(&candidate2).ok();
+                }
+            }
+        }
+
+        // Broader search: find any file matching the filename in search paths
+        let workspace = home.join(".openclaw/workspace");
+        if let Ok(entries) = walk_wasm_files(&workspace) {
+            for path in entries {
+                let fname = path.file_name().unwrap_or_default().to_string_lossy();
+                if fname == filename || (filename.contains("wasip2") && fname.contains("wasip2") && fname.contains(&filename.replace("-wasip2.wasm", "").replace(".wasm", ""))) {
+                    eprintln!("   📦 Local WASM: {}", path.display());
+                    return fs::read(&path).ok();
+                }
+            }
+        }
+    }
+
+    // Fallback: download (only if no local match)
+    eprintln!("   ⬇️ Not found locally, downloading: {}", url);
+    let cache_dir = dirs::home_dir().unwrap_or_default().join(".inlayer").join("wasm_cache");
+    fs::create_dir_all(&cache_dir).ok();
+    let cache_key = {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(url.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    let cached_path = cache_dir.join(format!("{}.wasm", cache_key));
+    if cached_path.exists() {
+        return fs::read(&cached_path).ok();
+    }
+    let response = reqwest::blocking::ClientBuilder::new()
+        .timeout(std::time::Duration::from_secs(60))
+        .build().ok()?
+        .get(url)
+        .send()
+        .ok()?;
+    if !response.status().is_success() { return None; }
+    let bytes = response.bytes().ok()?.to_vec();
+    fs::write(&cached_path, &bytes).ok();
+    Some(bytes)
+}
+
+/// Walk a directory recursively for .wasm files (max depth 3).
+fn walk_wasm_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut results = Vec::new();
+    if !dir.exists() { return Ok(results); }
+    fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) {
+        if depth > 3 { return; }
+        if let Ok(entries) = dir.read_dir() {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().map(|e| e == "wasm").unwrap_or(false) {
+                    out.push(path);
+                } else if path.is_dir() {
+                    walk(&path, depth + 1, out);
+                }
+            }
+        }
+    }
+    walk(dir, 0, &mut results);
+    Ok(results)
+}
+
+/// Find WASM by project_id in search paths.
+/// Looks for directory matching the project name (e.g. "nostr-identity" from "kampouse.near/nostr-identity")
+fn resolve_wasm_from_project(project_id: &str, config: &DaemonConfig) -> Option<Vec<u8>> {
+    // Extract project name from "owner/project" or use as-is
+    let project_name = project_id.split('/').last().unwrap_or(project_id);
+
+    for dir in &config.search_paths {
+        let base = PathBuf::from(dir);
+        if !base.exists() { continue; }
+
+        if let Ok(entries) = base.read_dir() {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() { continue; }
+
+                let dirname = path.file_name()?.to_string_lossy();
+                // Match by project name (e.g. "nostr-identity" matches "nostr-identity-zkp-tee")
+                if !dirname.contains(project_name) { continue; }
+
+                // Check for built WASM
+                let release = path.join("target").join("wasm32-wasip2").join("release");
+                if release.is_dir() {
+                    if let Ok(wasm_entries) = release.read_dir() {
+                        for wasm_entry in wasm_entries.flatten() {
+                            let wasm_path = wasm_entry.path();
+                            if wasm_path.is_file() && wasm_path.extension().map(|e| e == "wasm").unwrap_or(false) {
+                                let fname = wasm_path.file_name().unwrap_or_default().to_string_lossy();
+                                if !fname.starts_with('.') && !fname.contains("-deps") {
+                                    eprintln!("   📦 Project WASM: {}", wasm_path.display());
+                                    return fs::read(&wasm_path).ok();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Check for standalone WASM files in the directory
+                if let Ok(dir_entries) = path.read_dir() {
+                    for entry in dir_entries.flatten() {
+                        let p = entry.path();
+                        if p.is_file() && p.extension().map(|e| e == "wasm").unwrap_or(false) {
+                            let fname = p.file_name().unwrap_or_default().to_string_lossy();
+                            if fname.contains("wasip2") || fname.contains("p2") {
+                                eprintln!("   📦 Project WASM: {}", p.display());
+                                return fs::read(&p).ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!("   ⚠️ No WASM found for project: {}", project_id);
+    None
+}
+
 fn get_pending_ids(rpc: &Rpc, contract: &str) -> Result<Vec<u64>> {
     let args = serde_json::to_vec(&serde_json::json!({"from_index": 0, "limit": 10}))?;
     let bytes = rpc.view(contract, "get_pending_request_ids", &args)?;
@@ -270,11 +488,23 @@ fn get_pending_ids(rpc: &Rpc, contract: &str) -> Result<Vec<u64>> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+/// Parsed execution source from contract request
+#[derive(Debug, Clone)]
+enum ParsedSource {
+    /// Use WASM from a URL (download + cache)
+    WasmUrl { url: String, hash: String },
+    /// Use registered project WASM (match by project_id in search paths)
+    Project { project_id: String },
+    /// No source info — fall back to default WASM discovery
+    Unknown,
+}
+
 struct RequestInfo {
     input: String,
     max_instructions: u64,
     max_memory_mb: u32,
     max_execution_seconds: u64,
+    source: ParsedSource,
 }
 
 fn fetch_nonce_block(rpc_url: &str, signer: &InMemorySigner) -> Result<(u64, CryptoHash)> {
@@ -396,7 +626,7 @@ fn resolve_batch(
 
     if payloads.len() == 1 {
         let (req_id, success, output, time_ms, instructions) = &payloads[0];
-        for attempt in 0..2 {
+        for attempt in 0..5 {
             let (base_nonce, block_hash) = match nonce_cache.reserve_batch(1) {
                 Ok(r) => r,
                 Err(e) => return vec![(*req_id, Err(anyhow::anyhow!("nonce fetch failed: {}", e)))],
@@ -406,7 +636,7 @@ fn resolve_batch(
                 Ok(_) => return vec![(*req_id, result)],
                 Err(e) if e.to_string().contains("InvalidNonce") => {
                     nonce_cache.invalidate();
-                    if attempt == 0 { continue; }
+                    if attempt < 4 { continue; }
                 }
                 Err(_) => return vec![(*req_id, result)],
             }
@@ -727,6 +957,10 @@ async fn api_call(
         ),
     };
     let input_str = input_val.as_str().unwrap_or("").to_string();
+    let input_b64 = base64::engine::general_purpose::STANDARD.encode(input_str.as_bytes());
+
+    // Extract optional wasm_url for WasmUrl source
+    let body_wasm_url = body.get("wasm_url").and_then(|v| v.as_str()).map(|s| s.to_string());
 
     // Extract optional deposit amount (in yoctoNEAR)
     let deposit = body.get("deposit")
@@ -767,15 +1001,27 @@ async fn api_call(
                 _ => anyhow::bail!("unexpected query response for access key"),
             };
 
-            // Build transaction args with proper ExecutionSource::Project
-            let args = serde_json::json!({
-                "source": {
+            // Build source: use WasmUrl if provided, otherwise Project
+            let source = if let Some(wasm_url) = body_wasm_url {
+                serde_json::json!({
+                    "WasmUrl": {
+                        "url": wasm_url,
+                        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
+                        "build_target": "wasm32-wasip2"
+                    }
+                })
+            } else {
+                serde_json::json!({
                     "Project": {
                         "project_id": project_id,
                         "version_key": null
                     }
-                },
-                "input_data": input_str,
+                })
+            };
+
+            let args = serde_json::json!({
+                "source": source,
+                "input_data": input_b64,
                 "resource_limits": {
                     "max_instructions": 1_000_000_000,
                     "max_memory_mb": 128,
@@ -1370,6 +1616,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
     let dashboard_addr = parse_dashboard_flag(args).or(daemon_cfg.dashboard_addr.clone());
     let is_daemon = args.iter().any(|a| a == "--daemon");
+    let is_foreground = args.iter().any(|a| a == "--foreground");
     let use_tunnel = args.iter().any(|a| a == "--tunnel");
 
     // Validate configuration before starting daemon
@@ -1526,28 +1773,40 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                     move || fetch_nonce_block(&rpc_url, &signer_clone)
                 });
 
-                let wasm_path = match find_wasm(&daemon_cfg) {
-                    Some(w) => w,
-                    None => { log("WASM not found"); continue; }
-                };
-                log(&format!("   WASM: {}", wasm_path.display()));
-
-                let wasm_bytes = match get_wasm_bytes(&wasm_path) {
-                    Ok(b) => b,
-                    Err(e) => { log(&format!("   {}", e)); continue; }
-                };
+                // Resolve WASM per-request based on source (WasmUrl, Project, or default)
+                let default_wasm_bytes = find_wasm(&daemon_cfg)
+                    .and_then(|p| fs::read(&p).ok());
 
                 let wasm_results: Vec<WasmResult> = std::thread::scope(|s| {
                     let handles: Vec<_> = infos.into_iter()
                         .filter_map(|(req_id, info_result)| {
                             match info_result {
                                 Ok(info) => {
-                                    log(&format!("Request #{} — {}", req_id, info.input));
+                                    log(&format!("Request #{} — {}", req_id, &info.input[..info.input.len().min(80)]));
+
+                                    // Resolve WASM bytes for this specific request
+                                    let wasm_bytes = match resolve_wasm(&info.source, &daemon_cfg) {
+                                        Some(b) => {
+                                            log(&format!("   Source: {:?}", info.source));
+                                            b
+                                        }
+                                        None => match &default_wasm_bytes {
+                                            Some(b) => {
+                                                log("   Using default WASM (no source match)");
+                                                b.clone()
+                                            }
+                                            None => {
+                                                log("   No WASM found for this request, skipping");
+                                                return None;
+                                            }
+                                        }
+                                    };
+
                                     let mut env = HashMap::new();
                                     env.insert("REQUEST_TYPE".into(), "blockchain".into());
                                     let rpc_url = rpc_url.clone();
                                     Some(s.spawn(move || {
-                                        execute_single_wasm(wasm_bytes, req_id, &info.input, &rpc_url, &env, &info)
+                                        execute_single_wasm(&wasm_bytes, req_id, &info.input, &rpc_url, &env, &info)
                                     }))
                                 }
                                 Err(e) => { log(&format!("   Request #{} info failed: {}", req_id, e)); None }
@@ -1558,7 +1817,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                 });
 
                 let resolve_payloads: Vec<(u64, bool, String, u64, u64)> = wasm_results.into_iter().map(|result| {
-                    processed.insert(result.request_id);
+                    // NOTE: Don't insert into processed set yet — only mark after successful resolve
                     let record = ExecutionRecord {
                         request_id: result.request_id,
                         input: result.input.clone(),
@@ -1592,8 +1851,14 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
                 for (req_id, tx_result) in resolve_results {
                     match tx_result {
-                        Ok(tx_hash) => log(&format!("   Tx: {}", tx_hash)),
-                        Err(e) => log(&format!("   Submit #{} failed: {}", req_id, e)),
+                        Ok(tx_hash) => {
+                            processed.insert(req_id);
+                            log(&format!("   Tx: {}", tx_hash));
+                        },
+                        Err(e) => {
+                            // Don't mark as processed — will retry next poll
+                            log(&format!("   Submit #{} failed: {} (will retry)", req_id, e));
+                        },
                     }
                 }
 
