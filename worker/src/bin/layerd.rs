@@ -281,11 +281,19 @@ impl Rpc {
                     let parsed = result.and_then(|bytes| {
                         if bytes.is_empty() { anyhow::bail!("request {} not found", req_id); }
                         let req: serde_json::Value = serde_json::from_slice(&bytes)?;
-                        let input_b64 = req.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
-                        let decoded = base64::engine::general_purpose::STANDARD.decode(input_b64).unwrap_or_default();
-                        let limits = req.get("resource_limits");
+                        let input_raw = req.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
+                        // input_data is plain JSON string, not base64
+                        let input_str = if input_raw.is_empty() {
+                            String::new()
+                        } else {
+                            // Try base64 decode first, fall back to raw string
+                            match base64::engine::general_purpose::STANDARD.decode(input_raw) {
+                                Ok(decoded) if !decoded.is_empty() => String::from_utf8_lossy(&decoded).to_string(),
+                                _ => input_raw.to_string(),
+                            }
+                        };                        let limits = req.get("resource_limits");
                         Ok(RequestInfo {
-                            input: String::from_utf8_lossy(&decoded).to_string(),
+                            input: input_str,
                             max_instructions: limits.and_then(|l| l.get("max_instructions")).and_then(|v| v.as_u64()).unwrap_or(10_000_000_000),
                             max_memory_mb: limits.and_then(|l| l.get("max_memory_mb")).and_then(|v| v.as_u64()).unwrap_or(256) as u32,
                             max_execution_seconds: limits.and_then(|l| l.get("max_execution_seconds")).and_then(|v| v.as_u64()).unwrap_or(60),
