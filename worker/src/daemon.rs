@@ -1010,86 +1010,62 @@ async fn api_call(
         let wasm_result = execute_single_wasm(&wasm_bytes, 0, &input_str, &rpc_url, &env, &info);
         let elapsed = start.elapsed();
 
-        // 2. Fire-and-forget: submit request_execution in background thread
-        //    User gets instant response, daemon resolves on-chain asynchronously
+        // 2. Pre-warm nonce upfront, pass to background thread. No contention, no retries.
         if let (Some(signer), Some(contract_id), Some(nonce_cache)) = 
             (SHARED_SIGNER.get(), SHARED_CONTRACT_ID.get(), SHARED_NONCE_CACHE.get()) 
         {
-            let input_b64 = base64::engine::general_purpose::STANDARD.encode(input_str.as_bytes());
-            let source_json = if let ParsedSource::WasmUrl { ref url, .. } = source {
-                serde_json::json!({"WasmUrl": {"url": url, "hash": "0000000000000000000000000000000000000000000000000000000000000000", "build_target": "wasm32-wasip2"}})
-            } else {
-                serde_json::json!({"WasmUrl": {"url": "local", "hash": "0000000000000000000000000000000000000000000000000000000000000000", "build_target": "wasm32-wasip2"}})
-            };
-            let args = serde_json::json!({
-                "source": source_json,
-                "input_data": input_b64,
-                "resource_limits": {"max_instructions": 10_000_000_000u64, "max_memory_mb": 256u64, "max_execution_seconds": 60u64},
-                "secrets_ref": null, "response_format": null, "payer_account_id": null, "params": null
-            });
-
-            // Spawn background thread — doesn't block the response
-            // Stagger by 100ms to avoid RPC connection contention
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            let rpc_url_bg = rpc_url.clone();
-            std::thread::spawn(move || {
-                for _attempt in 0..3 {
-                    // Small delay between retries to avoid RPC contention
-                    if _attempt > 0 { std::thread::sleep(std::time::Duration::from_millis(200)); }
-                    match nonce_cache.reserve_batch(1) {
-                        Ok((nonce, block_hash)) => {
-                            let tx = TransactionV0 {
-                                signer_id: signer.account_id.clone(),
-                                public_key: signer.public_key.clone(),
-                                nonce,
-                                receiver_id: match contract_id.parse::<near_primitives::types::AccountId>() {
-                                    Ok(id) => id,
-                                    Err(e) => { eprintln!("   /call bg: contract_id parse error: {}", e); return; }
-                                },
-                                block_hash,
-                                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                                    method_name: "request_execution".to_string(),
-                                    args: serde_json::to_vec(&args).unwrap_or_default(),
-                                    gas: 300_000_000_000_000,
-                                    deposit: 7_001_000_000_000_000_000_000u128,
-                                }))],
-                            };
-                            let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
-                            let client = JsonRpcClient::connect(&rpc_url_bg);
-                            let rt = match tokio::runtime::Runtime::new() {
-                                Ok(r) => r,
-                                Err(_) => return,
-                            };
-                            // Use broadcast_tx_async (fire-and-forget) — no waiting
-                            let send_result = rt.block_on(async {
-                                client.call(methods::send_tx::RpcSendTransactionRequest {
-                                    signed_transaction: signed_tx,
-                                    wait_until: near_primitives::views::TxExecutionStatus::None,
-                                }).await
-                            });
-                            match send_result {
-                                Ok(_resp) => {
-                                    eprintln!("   /call bg: tx submitted");
-                                    return;
-                                }
-                                Err(e) => {
-                                    let err_str = format!("{}", e);
-                                    eprintln!("   /call bg: tx error: {}", err_str);
-                                    if err_str.contains("InvalidNonce") || err_str.contains("InvalidTxError") {
-                                        nonce_cache.invalidate();
-                                        continue;
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("   /call bg: nonce error: {}", e);
-                            return;
-                        }
-                    }
+            // Reserve nonce BEFORE spawning thread (atomic, no contention)
+            match nonce_cache.reserve_batch(1) {
+                Ok((nonce, block_hash)) => {
+                    let input_b64 = base64::engine::general_purpose::STANDARD.encode(input_str.as_bytes());
+                    let source_json = if let ParsedSource::WasmUrl { ref url, .. } = source {
+                        serde_json::json!({"WasmUrl": {"url": url, "hash": "0000000000000000000000000000000000000000000000000000000000000000", "build_target": "wasm32-wasip2"}})
+                    } else {
+                        serde_json::json!({"WasmUrl": {"url": "local", "hash": "0000000000000000000000000000000000000000000000000000000000000000", "build_target": "wasm32-wasip2"}})
+                    };
+                    let args = serde_json::json!({
+                        "source": source_json,
+                        "input_data": input_b64,
+                        "resource_limits": {"max_instructions": 10_000_000_000u64, "max_memory_mb": 256u64, "max_execution_seconds": 60u64},
+                        "secrets_ref": null, "response_format": null, "payer_account_id": null, "params": null
+                    });
+                    let receiver_id = match contract_id.parse::<near_primitives::types::AccountId>() {
+                        Ok(id) => id,
+                        Err(e) => { eprintln!("   /call: contract_id parse error: {}", e); return Ok(serde_json::json!({"status": "error", "error": format!("contract_id parse: {}", e)})); }
+                    };
+                    // Build + sign tx RIGHT NOW (before spawning) with pre-warmed nonce
+                    let tx = TransactionV0 {
+                        signer_id: signer.account_id.clone(),
+                        public_key: signer.public_key.clone(),
+                        nonce,
+                        receiver_id,
+                        block_hash,
+                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                            method_name: "request_execution".to_string(),
+                            args: serde_json::to_vec(&args).unwrap_or_default(),
+                            gas: 300_000_000_000_000,
+                            deposit: 7_001_000_000_000_000_000_000u128,
+                        }))],
+                    };
+                    let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
+                    // Only send in background (HTTP latency ~300ms) — tx is already signed
+                    std::thread::spawn(move || {
+                        let client = JsonRpcClient::connect("https://test.rpc.fastnear.com");
+                        let rt = match tokio::runtime::Runtime::new() {
+                            Ok(r) => r,
+                            Err(_) => return,
+                        };
+                        let _ = rt.block_on(async {
+                            client.call(methods::send_tx::RpcSendTransactionRequest {
+                                signed_transaction: signed_tx,
+                                wait_until: near_primitives::views::TxExecutionStatus::None,
+                            }).await
+                        });
+                        eprintln!("   /call bg: tx sent (nonce={})", nonce);
+                    });
                 }
-            });
+                Err(e) => eprintln!("   /call: nonce pre-warm failed: {}", e),
+            }
         }
 
         Ok(serde_json::json!({
