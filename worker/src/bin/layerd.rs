@@ -320,6 +320,15 @@ impl Rpc {
         let signer_account_id = signer.account_id.clone();
         let signer_public_key = signer.public_key.clone();
         let signer_clone = signer.clone();
+        let signer_clone2 = signer.clone();
+        let contract_id: near_primitives::types::AccountId = contract.parse()?;
+        let contract_id2 = contract_id.clone();
+        let method_name = method.to_string();
+        let method_name2 = method_name.clone();
+        let args_bytes = serde_json::to_vec(&args)?;
+        let args_bytes2 = args_bytes.clone();
+        let signer_account_id2 = signer_account_id.clone();
+        let signer_public_key2 = signer_public_key.clone();
 
         self.rt.block_on(async {
             let (nonce, block_hash) = {
@@ -336,16 +345,14 @@ impl Rpc {
                 }
             };
             
-            let args_bytes = serde_json::to_vec(&args)?;
-
             let transaction = TransactionV0 {
                 signer_id: signer_account_id,
                 public_key: signer_public_key,
                 nonce,
-                receiver_id: contract.parse()?,
+                receiver_id: contract_id,
                 block_hash,
                 actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                    method_name: method.to_string(),
+                    method_name,
                     args: args_bytes,
                     gas,
                     deposit,
@@ -363,6 +370,38 @@ impl Rpc {
                 Ok(_response) => {
                     *self.cached_key.lock().unwrap() = Some(CachedAccessKey { nonce, block_hash });
                     Ok(tx_hash)
+                }
+                Err(e) if e.to_string().contains("InvalidNonce") => {
+                    // Re-fetch nonce from RPC and retry once
+                    let (fetched_nonce, hash) = self.fetch_access_key(&signer_account_id2, &signer_public_key2).await?;
+                    let retry_nonce = fetched_nonce + 1;
+                    let retry_tx = TransactionV0 {
+                        signer_id: signer_account_id2,
+                        public_key: signer_public_key2,
+                        nonce: retry_nonce,
+                        receiver_id: contract_id2,
+                        block_hash: hash,
+                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                            method_name: method_name2,
+                            args: args_bytes2,
+                            gas,
+                            deposit,
+                        }))],
+                    };
+                    let signed_retry = Transaction::V0(retry_tx).sign(&Signer::InMemory(signer_clone2));
+                    let retry_hash = format!("{:?}", signed_retry.get_hash());
+                    match client.call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+                        signed_transaction: signed_retry,
+                    }).await {
+                        Ok(_) => {
+                            *self.cached_key.lock().unwrap() = Some(CachedAccessKey { nonce: retry_nonce, block_hash: hash });
+                            Ok(retry_hash)
+                        }
+                        Err(e2) => {
+                            *self.cached_key.lock().unwrap() = None;
+                            Err(anyhow::anyhow!("tx failed after nonce retry: {}", e2))
+                        }
+                    }
                 }
                 Err(e) => {
                     *self.cached_key.lock().unwrap() = None;
@@ -956,9 +995,10 @@ fn main() -> Result<()> {
                     if result.success {
                         log(&format!("   ✅ #{} | {}ms | {} instr", result.request_id, result.time_ms, result.instructions));
                         log(&format!("   📤 {}", result.output));
+                        // send_tx handles nonce retry internally
                         match resolve(&rpc, &signer, &cfg.contract_id, result.request_id, true, &result.output, result.time_ms, result.instructions) {
-                            Ok(tx_hash) => log(&format!("   ✅ Tx: {}", tx_hash)),
-                            Err(e) => log(&format!("   ❌ Submit failed: {}", e)),
+                            Ok(tx_hash) => { log(&format!("   ✅ Tx: {}", tx_hash)); }
+                            Err(e) => { log(&format!("   ❌ Submit failed: {}", e)); }
                         }
                     } else {
                         let err = result.error.unwrap_or_default();
