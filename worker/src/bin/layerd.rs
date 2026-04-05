@@ -404,7 +404,7 @@ impl Rpc {
             let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer_clone));
             let tx_hash = format!("{:?}", signed_tx.get_hash());
 
-            let request = methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
+            let request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
                 signed_transaction: signed_tx,
             };
 
@@ -432,7 +432,7 @@ impl Rpc {
                     };
                     let signed_retry = Transaction::V0(retry_tx).sign(&Signer::InMemory(signer_clone2));
                     let retry_hash = format!("{:?}", signed_retry.get_hash());
-                    match client.call(methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
+                    match client.call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
                         signed_transaction: signed_retry,
                     }).await {
                         Ok(_) => {
@@ -1006,8 +1006,8 @@ fn main() -> Result<()> {
                         .collect()
                 });
 
-                // Submit resolve txs sequentially (nonce ordering)
-                for result in wasm_results {
+                // Submit resolve txs in parallel using broadcast_tx_commit
+                let resolve_results: Vec<(u64, Result<String>)> = wasm_results.into_iter().map(|result| {
                     processed.insert(result.request_id);
 
                     let record = ExecutionRecord {
@@ -1030,15 +1030,25 @@ fn main() -> Result<()> {
                     if result.success {
                         log(&format!("   ✅ #{} | {}ms | {} instr", result.request_id, result.time_ms, result.instructions));
                         log(&format!("   📤 {}", result.output));
-                        // send_tx handles nonce retry internally
-                        match resolve(&rpc, &signer, &cfg.contract_id, result.request_id, true, &result.output, result.time_ms, result.instructions) {
-                            Ok(tx_hash) => { log(&format!("   ✅ Tx: {}", tx_hash)); }
-                            Err(e) => { log(&format!("   ❌ Submit failed: {}", e)); }
-                        }
                     } else {
                         let err = result.error.unwrap_or_default();
                         log(&format!("   ❌ #{}: {}", result.request_id, err));
-                        let _ = resolve(&rpc, &signer, &cfg.contract_id, result.request_id, false, "", 0, 0);
+                    }
+
+                    let req_id = result.request_id;
+                    let tx_result = if result.success {
+                        resolve(&rpc, &signer, &cfg.contract_id, result.request_id, true, &result.output, result.time_ms, result.instructions)
+                    } else {
+                        resolve(&rpc, &signer, &cfg.contract_id, result.request_id, false, "", 0, 0)
+                    };
+                    (req_id, tx_result)
+                }).collect();
+
+                // Log tx results
+                for (req_id, tx_result) in resolve_results {
+                    match tx_result {
+                        Ok(tx_hash) => log(&format!("   ✅ Tx: {}", tx_hash)),
+                        Err(e) => log(&format!("   ❌ Submit #{} failed: {}", req_id, e)),
                     }
                 }
 
