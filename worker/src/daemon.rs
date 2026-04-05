@@ -945,134 +945,66 @@ async fn api_contract(State(state): State<Arc<DashboardState>>) -> axum::Json<Co
 
 async fn api_call(
     State(state): State<Arc<DashboardState>>,
-    axum::extract::Path((owner, project)): axum::extract::Path<(String, String)>,
+    axum::extract::Path((_owner, project)): axum::extract::Path<(String, String)>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
     // Extract input from request body
-    let input_val = match body.get("input") {
-        Some(v) => v.clone(),
+    let input_str = match body.get("input") {
+        Some(v) => v.as_str().unwrap_or("").to_string(),
         None => return (
             axum::http::StatusCode::BAD_REQUEST,
             axum::Json(serde_json::json!({ "status": "failed", "error": "Missing 'input' field in request body" })),
         ),
     };
-    let input_str = input_val.as_str().unwrap_or("").to_string();
-    let input_b64 = base64::engine::general_purpose::STANDARD.encode(input_str.as_bytes());
 
-    // Extract optional wasm_url for WasmUrl source
-    let body_wasm_url = body.get("wasm_url").and_then(|v| v.as_str()).map(|s| s.to_string());
+    // Extract optional wasm_url hint for WASM resolution
+    let wasm_url_hint = body.get("wasm_url").and_then(|v| v.as_str()).map(|s| s.to_string());
 
-    // Extract optional deposit amount (in yoctoNEAR)
-    let deposit = body.get("deposit")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<u128>().ok())
-        .unwrap_or(7_000_100_000_000_000_000_000); // Default: 7.0001 NEAR
-
-    // Get signer from dashboard state
-    let signer = match &*state.signer.lock().unwrap() {
-        Some(s) => s.clone(),
-        None => return (
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            axum::Json(serde_json::json!({ "status": "failed", "error": "Daemon not ready - signer not initialized" })),
-        ),
-    };
-
-    let contract_id = state.contract_id.clone();
     let rpc_url = state.rpc_url.clone();
-    let project_id = format!("{}/{}", owner, project);
+    let search_paths = state.search_paths.clone();
+    let start = std::time::Instant::now();
 
-    // Call contract's request_execution method
-    let result = tokio::task::spawn_blocking(move || -> Result<u64> {
-        let client = JsonRpcClient::connect(rpc_url);
-        let rt = tokio::runtime::Runtime::new()?;
+    // Execute WASM directly — no blockchain, no nonce issues
+    let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+        // Resolve WASM: try project name match, then wasm_url, then default
+        let source = if let Some(ref url) = wasm_url_hint {
+            ParsedSource::WasmUrl { url: url.clone(), hash: String::new() }
+        } else {
+            ParsedSource::Project { project_id: project.clone() }
+        };
 
-        rt.block_on(async {
-            // Fetch current nonce and block hash
-            let query = methods::query::RpcQueryRequest {
-                block_reference: BlockReference::latest(),
-                request: QueryRequest::ViewAccessKey {
-                    account_id: signer.account_id.clone(),
-                    public_key: signer.public_key.clone(),
-                },
-            };
-            let response = client.call(query).await?;
-            let nonce = match response.kind {
-                QueryResponseKind::AccessKey(ak) => ak.nonce + 1,
-                _ => anyhow::bail!("unexpected query response for access key"),
-            };
+        let temp_config = DaemonConfig { search_paths, ..Default::default() };
+        let wasm_bytes = resolve_wasm(&source, &temp_config)
+            .or_else(|| {
+                let default_config = DaemonConfig { search_paths: temp_config.search_paths.clone(), ..Default::default() };
+                find_wasm(&default_config).and_then(|p| fs::read(&p).ok())
+            })
+            .ok_or_else(|| anyhow::anyhow!("No WASM found for project: {}", project))?;
 
-            // Build source: use WasmUrl if provided, otherwise Project
-            let source = if let Some(wasm_url) = body_wasm_url {
-                serde_json::json!({
-                    "WasmUrl": {
-                        "url": wasm_url,
-                        "hash": "0000000000000000000000000000000000000000000000000000000000000000",
-                        "build_target": "wasm32-wasip2"
-                    }
-                })
-            } else {
-                serde_json::json!({
-                    "Project": {
-                        "project_id": project_id,
-                        "version_key": null
-                    }
-                })
-            };
+        let info = RequestInfo {
+            input: input_str.clone(),
+            max_instructions: 10_000_000_000,
+            max_memory_mb: 256,
+            max_execution_seconds: 60,
+            source,
+        };
+        let mut env = HashMap::new();
+        env.insert("REQUEST_TYPE".into(), "http".into());
 
-            let args = serde_json::json!({
-                "source": source,
-                "input_data": input_b64,
-                "resource_limits": {
-                    "max_instructions": 1_000_000_000,
-                    "max_memory_mb": 128,
-                    "max_execution_seconds": 60
-                },
-                "secrets_ref": null,
-                "response_format": null,
-                "payer_account_id": null,
-                "params": null
-            });
-            let args_bytes = serde_json::to_vec(&args)?;
+        let wasm_result = execute_single_wasm(&wasm_bytes, 0, &input_str, &rpc_url, &env, &info);
 
-            let transaction = TransactionV0 {
-                signer_id: signer.account_id.clone(),
-                public_key: signer.public_key.clone(),
-                nonce,
-                receiver_id: contract_id.parse()?,
-                block_hash: response.block_hash,
-                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                    method_name: "request_execution".to_string(),
-                    args: args_bytes,
-                    gas: 300_000_000_000_000, // 300 TGas
-                    deposit,
-                }))],
-            };
-
-            let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer));
-
-            // Send transaction
-            client.call(methods::send_tx::RpcSendTransactionRequest {
-                signed_transaction: signed_tx,
-                wait_until: near_primitives::views::TxExecutionStatus::ExecutedOptimistic,
-            }).await.map_err(|e| anyhow::anyhow!("send_tx failed: {}", e))?;
-
-            // Parse request_id from the result
-            // Note: The contract returns the request_id in the execution outcome
-            // For now, we'll return a placeholder - in production you'd parse the outcome
-            Ok(1) // TODO: Parse actual request_id from transaction outcome
-        })
+        let elapsed = start.elapsed();
+        Ok(serde_json::json!({
+            "status": if wasm_result.success { "completed" } else { "failed" },
+            "output": if wasm_result.success { serde_json::from_str::<serde_json::Value>(&wasm_result.output).unwrap_or_else(|_| serde_json::json!(wasm_result.output)) } else { serde_json::Value::Null },
+            "error": wasm_result.error,
+            "execution_time_ms": elapsed.as_millis() as u64,
+            "instructions": wasm_result.instructions,
+        }))
     }).await;
 
     match result {
-        Ok(Ok(request_id)) => (
-            axum::http::StatusCode::ACCEPTED,
-            axum::Json(serde_json::json!({
-                "status": "submitted",
-                "request_id": request_id,
-                "project_id": format!("{}/{}", owner, project),
-                "message": "Execution request submitted to blockchain. Daemon will execute and resolve shortly.",
-            })),
-        ),
+        Ok(Ok(response)) => (axum::http::StatusCode::OK, axum::Json(response)),
         Ok(Err(e)) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(serde_json::json!({ "status": "failed", "error": e.to_string() })),
@@ -1729,7 +1661,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
     let rpc = Rpc::new(&rpc_url)?;
     let mut processed: HashSet<u64> = HashSet::new();
-    let nonce_cache = NonceCache::new(rpc_url.clone(), signer.clone());
+    let nonce_cache = Arc::new(NonceCache::new(rpc_url.clone(), signer.clone()));
     let _pid_path_cleanup = daemon_cfg.pid_file_path();
     // ctrlc_handler(&_pid_path_cleanup); // TODO: add ctrlc handling
 
