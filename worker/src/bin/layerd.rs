@@ -102,8 +102,6 @@ struct Config {
     env: HashMap<String, String>,
     /// Dashboard HTTP server bind address (e.g. "127.0.0.1:8082")
     dashboard_addr: Option<String>,
-    /// Poll mode: "poll" (default) or "websocket"
-    poll_mode: String,
 }
 
 impl Default for Config {
@@ -121,7 +119,6 @@ impl Default for Config {
             pid_file: None,
             env: HashMap::new(),
             dashboard_addr: None,
-            poll_mode: "poll".into(),
         }
     }
 }
@@ -549,179 +546,6 @@ fn spawn_dashboard(addr: &str, state: Arc<DashboardState>) {
     });
 }
 
-// ── WebSocket subscription ──────────────────────────────────────────────────
-
-fn rpc_to_ws_url(rpc_url: &str) -> String {
-    let url = rpc_url
-        .replace("https://", "wss://")
-        .replace("http://", "ws://");
-    if url.ends_with("/ws") { url } else { format!("{}/ws", url.trim_end_matches('/')) }
-}
-
-fn websocket_worker(
-    cfg: &Config,
-    rpc: &Rpc,
-    signer: &InMemorySigner,
-    dashboard_state: &Arc<DashboardState>,
-    processed: &mut HashSet<u64>,
-    log: &mut dyn FnMut(&str),
-) -> Result<()> {
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
-    use futures_util::{SinkExt, StreamExt};
-
-    let ws_url = rpc_to_ws_url(&cfg.rpc_url);
-    log(&format!("🔗 Connecting to WS: {}", ws_url));
-
-    let rt = tokio::runtime::Runtime::new()?;
-    let mut consecutive_ws_errors = 0u32;
-
-    'reconnect: loop {
-        let connect_result = rt.block_on(async {
-            match connect_async(&ws_url).await {
-                Ok((ws_stream, _)) => {
-                    let (mut write, mut read) = ws_stream.split();
-                    // Subscribe to finalized blocks
-                    let sub_msg = r#"{"jsonrpc":"2.0","id":1,"method":"subscribe","params":["block_finalized"]}"#;
-                    write.send(Message::Text(sub_msg.into())).await.map_err(|e| anyhow::anyhow!("{}", e))?;
-                    Ok((write, read))
-                }
-                Err(e) => Err(anyhow::anyhow!("WS connect failed: {}", e)),
-            }
-        });
-
-        let (mut write, mut read) = match connect_result {
-            Ok(pair) => {
-                consecutive_ws_errors = 0;
-                log(&format!("✅ WS connected, subscribed to block_finalized"));
-                pair
-            }
-            Err(e) => {
-                consecutive_ws_errors += 1;
-                let backoff = std::cmp::min(2u64.pow(std::cmp::min(consecutive_ws_errors, 8)), 120);
-                log(&format!("❌ {} (retry in {}s, attempt #{})", e, backoff, consecutive_ws_errors));
-                if consecutive_ws_errors >= 10 {
-                    log("❌ WS failed too many times, falling back to poll mode");
-                    return Err(anyhow::anyhow!("WS fallback to poll"));
-                }
-                std::thread::sleep(Duration::from_secs(backoff));
-                continue 'reconnect;
-            }
-        };
-
-        // Read messages
-        loop {
-            let msg_result = rt.block_on(async { futures_util::StreamExt::next(&mut read).await });
-            match msg_result {
-                Some(Ok(Message::Text(text))) => {
-                    // Check if it's a block notification
-                    if text.contains("block_finalized") || text.contains("block") {
-                        // Update poll count
-                        {
-                            let mut st = dashboard_state.status.lock().unwrap();
-                            st.poll_count += 1;
-                            st.last_poll_time = Some(now());
-                        }
-
-                        // Check pending requests
-                        match get_pending_ids(&rpc, &cfg.contract_id) {
-                            Ok(ids) => {
-                                if !ids.is_empty() {
-                                    log(&format!("Pending: {:?}", ids));
-                                    for req_id in &ids {
-                                        if processed.contains(req_id) { continue; }
-                                        process_request(req_id, &rpc, &cfg, &signer, &dashboard_state, processed, log);
-                                    }
-                                }
-                            }
-                            Err(e) => log(&format!("❌ RPC error: {}", e)),
-                        }
-                    }
-                }
-                Some(Ok(Message::Ping(data))) => {
-                    let _ = rt.block_on(async { write.send(Message::Pong(data)).await });
-                }
-                Some(Ok(Message::Close(_))) | None => {
-                    log("⚠️ WS disconnected, reconnecting...");
-                    std::thread::sleep(Duration::from_secs(2));
-                    continue 'reconnect;
-                }
-                _ => {}
-            }
-        }
-    }
-}
-
-fn process_request(
-    req_id: &u64,
-    rpc: &Rpc,
-    cfg: &Config,
-    signer: &InMemorySigner,
-    dashboard_state: &Arc<DashboardState>,
-    processed: &mut HashSet<u64>,
-    log: &mut dyn FnMut(&str),
-) {
-    log(&format!("📋 Request #{}", req_id));
-
-    let req_info = match get_request_info(&rpc, &cfg.contract_id, *req_id) {
-        Ok(i) => i,
-        Err(e) => { log(&format!("   ❌ {}", e)); return; }
-    };
-    log(&format!("   Input: {}", req_info.input));
-
-    let wasm = match find_wasm(&cfg.wasm_search_dirs) {
-        Some(w) => w,
-        None => { log("   ❌ WASM not found"); return; }
-    };
-    log(&format!("   WASM: {}", wasm.display()));
-
-    log("   🏃 Running...");
-    match execute_wasm(&wasm, &req_info.input, &cfg.rpc_url, &cfg.env, &req_info) {
-        Ok((success, output, time_ms, instructions)) => {
-            log(&format!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions));
-            log(&format!("   📤 {}", output));
-
-            let record = ExecutionRecord {
-                request_id: *req_id,
-                input: req_info.input.clone(),
-                output: output.clone(),
-                execution_time_ms: time_ms,
-                instructions,
-                timestamp: now(),
-                success,
-            };
-            {
-                let mut hist = dashboard_state.history.lock().unwrap();
-                hist.push(record);
-                if hist.len() > 200 { let e = hist.len().saturating_sub(200); hist.drain(0..e); }
-            }
-
-            match resolve(&rpc, &signer, &cfg.contract_id, *req_id, success, &output, time_ms, instructions) {
-                Ok(tx_hash) => log(&format!("   ✅ Tx: {}", tx_hash)),
-                Err(e) => log(&format!("   ❌ Submit failed: {}", e)),
-            }
-        }
-        Err(e) => {
-            log(&format!("   ❌ {}", e));
-            let record = ExecutionRecord {
-                request_id: *req_id,
-                input: req_info.input.clone(),
-                output: format!("Error: {}", e),
-                execution_time_ms: 0,
-                instructions: 0,
-                timestamp: now(),
-                success: false,
-            };
-            {
-                let mut hist = dashboard_state.history.lock().unwrap();
-                hist.push(record);
-                if hist.len() > 200 { let e = hist.len().saturating_sub(200); hist.drain(0..e); }
-            }
-            let _ = resolve(&rpc, &signer, &cfg.contract_id, *req_id, false, "", 0, 0);
-        }
-    }
-    processed.insert(*req_id);
-}
-
 // ── Main ────────────────────────────────────────────────────────────────────
 
 fn usage() {
@@ -845,8 +669,8 @@ fn main() -> Result<()> {
         let _ = dashboard_state.events_tx.send(msg.to_string());
     };
 
-    log(&format!("⚡ layerd started — Contract: {} Account: {} RPC: {} PollMode: {}",
-        cfg.contract_id, cfg.account_id, cfg.rpc_url, cfg.poll_mode));
+    log(&format!("⚡ layerd started — Contract: {} Account: {} RPC: {}",
+        cfg.contract_id, cfg.account_id, cfg.rpc_url));
 
     let rpc = Rpc::new(&cfg.rpc_url)?;
     let mut processed: HashSet<u64> = HashSet::new();
@@ -855,16 +679,6 @@ fn main() -> Result<()> {
     let pid_path_cleanup = cfg.pid_file_path();
     ctrlc_handler(&pid_path_cleanup);
 
-    // ── WebSocket mode ──────────────────────────────────────────────
-    if cfg.poll_mode == "websocket" {
-        let ws_result = websocket_worker(&cfg, &rpc, &signer, &dashboard_state, &mut processed, &mut log);
-        if ws_result.is_err() {
-            log("⚠️ Falling back to poll mode...");
-        }
-        // If websocket_worker returns (fallback), continue to poll loop below
-    }
-
-    // ── Poll mode ───────────────────────────────────────────────────
     let mut consecutive_errors = 0u32;
 
     loop {
@@ -882,9 +696,78 @@ fn main() -> Result<()> {
                     // silent — nothing to do
                 } else {
                     log(&format!("Pending: {:?}", ids));
+
                     for req_id in &ids {
                         if processed.contains(req_id) { continue; }
-                        process_request(req_id, &rpc, &cfg, &signer, &dashboard_state, &mut processed, &mut log);
+                        log(&format!("📋 Request #{}", req_id));
+
+                        let req_info = match get_request_info(&rpc, &cfg.contract_id, *req_id) {
+                            Ok(i) => i,
+                            Err(e) => { log(&format!("   ❌ {}", e)); continue; }
+                        };
+                        log(&format!("   Input: {}", req_info.input));
+
+                        let wasm = match find_wasm(&cfg.wasm_search_dirs) {
+                            Some(w) => w,
+                            None => { log("   ❌ WASM not found"); continue; }
+                        };
+                        log(&format!("   WASM: {}", wasm.display()));
+
+                        log("   🏃 Running...");
+                        match execute_wasm(&wasm, &req_info.input, &cfg.rpc_url, &cfg.env, &req_info) {
+                            Ok((success, output, time_ms, instructions)) => {
+                                log(&format!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions));
+                                log(&format!("   📤 {}", output));
+
+                                // Record execution
+                                let record = ExecutionRecord {
+                                    request_id: *req_id,
+                                    input: req_info.input.clone(),
+                                    output: output.clone(),
+                                    execution_time_ms: time_ms,
+                                    instructions,
+                                    timestamp: now(),
+                                    success,
+                                };
+                                {
+                                    let mut hist = dashboard_state.history.lock().unwrap();
+                                    hist.push(record);
+                                    // Keep last 200
+                                    if hist.len() > 200 {
+                                        let excess = hist.len().saturating_sub(200); hist.drain(0..excess);
+                                    }
+                                }
+
+                                match resolve(&rpc, &signer, &cfg.contract_id, *req_id, success, &output, time_ms, instructions) {
+                                    Ok(tx_hash) => log(&format!("   ✅ Tx: {}", tx_hash)),
+                                    Err(e) => log(&format!("   ❌ Submit failed: {}", e)),
+                                }
+                            }
+                            Err(e) => {
+                                log(&format!("   ❌ {}", e));
+
+                                // Record failed execution
+                                let record = ExecutionRecord {
+                                    request_id: *req_id,
+                                    input: req_info.input.clone(),
+                                    output: format!("Error: {}", e),
+                                    execution_time_ms: 0,
+                                    instructions: 0,
+                                    timestamp: now(),
+                                    success: false,
+                                };
+                                {
+                                    let mut hist = dashboard_state.history.lock().unwrap();
+                                    hist.push(record);
+                                    if hist.len() > 200 {
+                                        let excess = hist.len().saturating_sub(200); hist.drain(0..excess);
+                                    }
+                                }
+
+                                let _ = resolve(&rpc, &signer, &cfg.contract_id, *req_id, false, "", 0, 0);
+                            }
+                        }
+                        processed.insert(*req_id);
                     }
                 }
             }
