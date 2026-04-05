@@ -3843,6 +3843,7 @@ dependencies = [
  "bollard",
  "borsh",
  "bs58 0.5.1",
+ "crossbeam-channel",
  "dirs 5.0.1",
  "dotenv",
  "dstack-sdk",

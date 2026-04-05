@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
+use crossbeam_channel::{Receiver, Sender};
 
 use near_crypto::{InMemorySigner, Signer};
 use near_jsonrpc_client::{methods, JsonRpcClient};
@@ -120,6 +121,85 @@ struct DashboardStatusInner {
     rpc_url: String,
     poll_interval_secs: u64,
     dashboard_addr: Option<String>,
+}
+
+// ── Block Watcher (neardata.xyz event-driven polling) ───────────────────────
+
+/// Derives the neardata.xyz base URL from the network name.
+fn neardata_base_url(network: &str) -> String {
+    match network {
+        "mainnet" => "https://neardata.xyz".to_string(),
+        _ => format!("https://{}.neardata.xyz", network),
+    }
+}
+
+/// Discovers the latest finalized block height from neardata.xyz.
+/// Returns None on any error (caller falls back to RPC).
+fn discover_neardata_height(base_url: &str) -> Option<u64> {
+    let url = format!("{}/v0/last_block/final", base_url);
+    let resp = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?
+        .get(&url)
+        .send()
+        .ok()?;
+
+    // neardata redirects /v0/last_block/final → /v0/block/<height>
+    let final_url = resp.url();
+    final_url.path_segments()
+        .and_then(|mut s| s.next_back())
+        .and_then(|s: &str| s.parse().ok())
+}
+
+/// Spawns a background thread that watches for new blocks via neardata.xyz.
+/// Sends the new block height on the channel whenever a new block is detected.
+/// Falls back to periodic ticks if neardata is unavailable.
+fn spawn_block_watcher(network: &str, poll_interval_secs: u64) -> Receiver<u64> {
+    let (tx, rx) = crossbeam_channel::bounded(16);
+    let base_url = neardata_base_url(network);
+
+    std::thread::Builder::new()
+        .name("block-watcher".into())
+        .spawn(move || {
+            let mut last_height: Option<u64> = None;
+            let mut neardata_failures: u32 = 0;
+
+            loop {
+                // Try neardata.xyz first
+                let discovered = discover_neardata_height(&base_url);
+
+                match discovered {
+                    Some(height) => {
+                        neardata_failures = 0;
+                        if last_height != Some(height) {
+                            last_height = Some(height);
+                            if tx.send(height).is_err() {
+                                break; // Receiver dropped, exit
+                            }
+                        }
+                        // neardata works — poll every ~600ms (NEAR block time ~1s)
+                        std::thread::sleep(Duration::from_millis(600));
+                    }
+                    None => {
+                        neardata_failures += 1;
+                        // Fallback: send a tick anyway so the main loop can use RPC
+                        if tx.send(0).is_err() {
+                            break;
+                        }
+                        let backoff = if neardata_failures > 10 {
+                            std::cmp::min(poll_interval_secs * 2, 120)
+                        } else {
+                            poll_interval_secs
+                        };
+                        std::thread::sleep(Duration::from_secs(backoff));
+                    }
+                }
+            }
+        })
+        .expect("failed to spawn block watcher thread");
+
+    rx
 }
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -946,10 +1026,26 @@ fn main() -> Result<()> {
     let pid_path_cleanup = cfg.pid_file_path();
     ctrlc_handler(&pid_path_cleanup);
 
+    // ── Event-driven block watcher ──────────────────────────────────────
+    // Spawns a background thread that monitors neardata.xyz for new blocks.
+    // Sends block height on `block_rx` whenever a new block is detected.
+    // Falls back to periodic ticks if neardata is unavailable.
+    let block_rx = spawn_block_watcher(&cfg.network, cfg.poll_interval_secs);
+    log("📡 Block watcher started (neardata.xyz event-driven polling)");
+
     let mut consecutive_errors = 0u32;
-    let mut last_block_height: Option<u64> = None; // Optimization #3
 
     loop {
+        // Wait for next block notification from the watcher thread.
+        // Height 0 = fallback tick (neardata unavailable), just poll via RPC.
+        let _watcher_height = match block_rx.recv_timeout(Duration::from_secs(cfg.poll_interval_secs * 3)) {
+            Ok(h) => h,
+            Err(_) => {
+                // Channel timeout — neardata watcher may be stuck, poll anyway
+                0
+            }
+        };
+
         // Update poll count
         {
             let mut st = dashboard_state.status.lock().unwrap();
@@ -957,22 +1053,11 @@ fn main() -> Result<()> {
             st.last_poll_time = Some(now());
         }
 
-        // Optimization #3: Skip polling if block height hasn't changed
-        let current_height = rpc.get_block_height().ok();
-        if let (Some(h), Some(last)) = (current_height, last_block_height) {
-            if h == last {
-                std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
-                continue;
-            }
-        }
-
         match get_pending_ids(&rpc, &cfg.contract_id) {
             Ok(ids) => {
                 consecutive_errors = 0;
                 if ids.is_empty() {
-                    // Update block height for idle skip
-                    last_block_height = current_height;
-                    std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
+                    // No pending requests — wait for next block notification
                     continue;
                 }
 
@@ -985,8 +1070,7 @@ fn main() -> Result<()> {
                     .collect();
 
                 if unprocessed.is_empty() {
-                    // All already processed — just sleep
-                    std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
+                    // All already processed — wait for next block notification
                     continue;
                 }
 
@@ -1090,9 +1174,8 @@ fn main() -> Result<()> {
                 }
 
                 // Optimization #4: Pipeline — immediately re-poll instead of sleeping
-                // Block height changed since we had work, update tracker
-                last_block_height = None; // Force re-check on next iteration
-                continue; // Loop immediately — no sleep
+                // After processing, immediately wait for next block (no artificial delay)
+                continue;
             }
             Err(e) => {
                 consecutive_errors += 1;
