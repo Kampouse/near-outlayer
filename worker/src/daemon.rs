@@ -60,6 +60,8 @@ static SHARED_SIGNER: OnceLock<InMemorySigner> = OnceLock::new();
 
 /// Global contract id — set once after config loads
 static SHARED_CONTRACT_ID: OnceLock<String> = OnceLock::new();
+/// Global deposit amount in yoctoNEAR — set once after config loads
+static SHARED_DEPOSIT_YOCTO: OnceLock<u128> = OnceLock::new();
 
 fn init_compiled_cache(secret_key_bytes: [u8; 32]) {
     let home = dirs::home_dir().unwrap_or_default();
@@ -1032,7 +1034,7 @@ async fn api_call(
                             method_name: "request_execution".to_string(),
                             args: serde_json::to_vec(&args).unwrap_or_default(),
                             gas: 300_000_000_000_000,
-                            deposit: 7_001_000_000_000_000_000_000u128,
+                            deposit: SHARED_DEPOSIT_YOCTO.get().copied().unwrap_or(7_001_000_000_000_000_000_000u128),
                         }))],
                     };
                     let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
@@ -1336,6 +1338,8 @@ pub struct DaemonConfig {
     pub search_paths: Vec<String>,
     /// Cloudflare tunnel URL (auto-populated when using --tunnel)
     pub tunnel_url: Option<String>,
+    /// Deposit for request_execution in yoctoNEAR (default: 7.001 NEAR)
+    pub deposit_yocto: u128,
 }
 
 impl Default for DaemonConfig {
@@ -1350,11 +1354,15 @@ impl Default for DaemonConfig {
             dashboard_addr: None,
             search_paths: vec!["./wasi-examples".to_string()],
             tunnel_url: None,
+            deposit_yocto: 7_001_000_000_000_000_000_000u128, // 7.001 NEAR
         }
     }
 }
 
 impl DaemonConfig {
+    fn deposit_yocto(&self) -> u128 {
+        self.deposit_yocto
+    }
     fn validate(&self) -> Result<()> {
         // Check if using default placeholder values
         if self.account_id.contains("your-account") {
@@ -1730,8 +1738,16 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     SHARED_NONCE_CACHE.set(nonce_cache.clone()).ok();
     SHARED_SIGNER.set(signer.clone()).ok();
     SHARED_CONTRACT_ID.set(daemon_cfg.contract_id.clone()).ok();
-    let _pid_path_cleanup = daemon_cfg.pid_file_path();
-    // ctrlc_handler(&_pid_path_cleanup); // TODO: add ctrlc handling
+    SHARED_DEPOSIT_YOCTO.set(daemon_cfg.deposit_yocto).ok();
+    SHARED_DEPOSIT_YOCTO.set(daemon_cfg.deposit_yocto).ok();
+    let pid_path = daemon_cfg.pid_file_path();
+    // Clean up PID file on Ctrl+C / SIGTERM
+    let pid_path_cleanup = pid_path.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("Received Ctrl+C, shutting down...");
+        let _ = std::fs::remove_file(&pid_path_cleanup);
+        std::process::exit(0);
+    }).ok();
 
     let block_rx = spawn_block_watcher(&daemon_cfg.network, daemon_cfg.poll_interval_secs);
     log("Block watcher started (neardata.xyz event-driven polling)");
