@@ -300,6 +300,25 @@ impl Contract {
         self.resolve_execution_internal(request_id, response);
     }
 
+    /// Batch resolve multiple executions in a single transaction.
+    /// Each entry is (request_id, response). Processes all sequentially.
+    /// Returns number of successfully resolved requests.
+    pub fn batch_resolve_execution(&mut self, entries: Vec<(u64, ExecutionResponse)>) -> u32 {
+        // Only operator can resolve executions
+        self.assert_operator();
+
+        let mut resolved = 0u32;
+        for (request_id, response) in entries {
+            if self.pending_requests.contains_key(&request_id) {
+                self.resolve_execution_internal(request_id, response);
+                resolved += 1;
+            } else {
+                log!("Skipping unknown request_id: {}", request_id);
+            }
+        }
+        resolved
+    }
+
     #[allow(unused_variables)]
     #[private]
     /// Callback function to handle execution completion

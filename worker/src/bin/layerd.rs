@@ -611,7 +611,8 @@ fn resolve_one(
     })
 }
 
-/// Batch-resolve with cached nonces + parallel submission + InvalidNonce retry.
+/// Batch-resolve via single batch_resolve_execution contract call.
+/// Sends all results in one transaction instead of N separate ones.
 fn resolve_batch(
     nonce_cache: &NonceCache, signer: &InMemorySigner, contract: &str,
     payloads: Vec<(u64, bool, String, u64, u64)>,
@@ -620,53 +621,93 @@ fn resolve_batch(
         return Vec::new();
     }
 
-    for attempt in 0..2 {
-        let (base_nonce, block_hash) = match nonce_cache.reserve_batch(payloads.len()) {
-            Ok(r) => r,
-            Err(e) => {
-                nonce_cache.invalidate();
-                return payloads.into_iter()
-                    .map(|(id, _, _, _, _)| (id, Err(anyhow::anyhow!("nonce fetch failed: {}", e))))
-                    .collect();
-            }
-        };
-
-        let rpc_url = &nonce_cache.rpc_url;
-
-        let results: Vec<(u64, Result<String>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = payloads.iter().enumerate().map(|(i, (req_id, success, output, time_ms, instructions))| {
-                let nonce = base_nonce + i as u64;
-                let req_id = *req_id;
-                let success = *success;
-                let output = output.clone();
-                let time_ms = *time_ms;
-                let instructions = *instructions;
-                s.spawn(move || {
-                    let result = resolve_one(rpc_url, signer, contract, req_id, success, &output, time_ms, instructions, nonce, block_hash);
-                    (req_id, result)
-                })
-            }).collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-
-        let has_nonce_error = results.iter().any(|(_, r)| {
-            r.as_ref().err().map_or(false, |e| e.to_string().contains("InvalidNonce"))
-        });
-
-        if has_nonce_error {
-            nonce_cache.invalidate();
-            if attempt == 0 {
-                continue; // Retry with fresh nonce
+    // If only 1 request, use individual resolve with InvalidNonce retry
+    if payloads.len() == 1 {
+        let (req_id, success, output, time_ms, instructions) = &payloads[0];
+        for attempt in 0..2 {
+            let (base_nonce, block_hash) = match nonce_cache.reserve_batch(1) {
+                Ok(r) => r,
+                Err(e) => return vec![(*req_id, Err(anyhow::anyhow!("nonce fetch failed: {}", e)))],
+            };
+            let result = resolve_one(&nonce_cache.rpc_url, signer, contract, *req_id, *success, output, *time_ms, *instructions, base_nonce, block_hash);
+            match &result {
+                Ok(_) => return vec![(*req_id, result)],
+                Err(e) if e.to_string().contains("InvalidNonce") => {
+                    nonce_cache.invalidate();
+                    if attempt == 0 { continue; }
+                }
+                Err(_) => return vec![(*req_id, result)],
             }
         }
-
-        return results;
+        return vec![(*req_id, Err(anyhow::anyhow!("nonce retry exhausted")))];
     }
 
-    // Should not reach here, but just in case
-    payloads.into_iter()
-        .map(|(id, _, _, _, _)| (id, Err(anyhow::anyhow!("nonce retry exhausted"))))
-        .collect()
+    // Multiple requests → single batch_resolve_execution call
+    let entries: Vec<serde_json::Value> = payloads.iter().map(|(req_id, success, output, time_ms, instructions)| {
+        serde_json::json!([
+            req_id,
+            {
+                "success": success,
+                "output": {"Text": output},
+                "error": if *success { serde_json::Value::Null } else { serde_json::Value::String("Execution failed".into()) },
+                "resources_used": {"instructions": instructions, "time_ms": time_ms},
+                "compilation_note": null,
+                "refund_usd": null,
+            }
+        ])
+    }).collect();
+
+    let args = serde_json::json!({ "entries": entries });
+
+    let rpc_url = &nonce_cache.rpc_url;
+    let (base_nonce, block_hash) = match nonce_cache.reserve_batch(1) {
+        Ok(r) => r,
+        Err(e) => {
+            nonce_cache.invalidate();
+            return payloads.into_iter()
+                .map(|(id, _, _, _, _)| (id, Err(anyhow::anyhow!("nonce fetch failed: {}", e))))
+                .collect();
+        }
+    };
+
+    let result = (|| -> Result<String> {
+        let client = JsonRpcClient::connect(rpc_url);
+        let rt = tokio::runtime::Runtime::new()?;
+
+        rt.block_on(async {
+            let transaction = TransactionV0 {
+                signer_id: signer.account_id.clone(),
+                public_key: signer.public_key.clone(),
+                nonce: base_nonce,
+                receiver_id: contract.parse()?,
+                block_hash,
+                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                    method_name: "batch_resolve_execution".to_string(),
+                    args: serde_json::to_vec(&args)?,
+                    gas: 100_000_000_000_000 * payloads.len() as u64,
+                    deposit: 0,
+                }))],
+            };
+
+            let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer.clone()));
+            let tx_hash = format!("{:?}", signed_tx.get_hash());
+
+            client.call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+                signed_transaction: signed_tx,
+            }).await.map_err(|e| anyhow::anyhow!("batch broadcast failed: {}", e))?;
+
+            Ok(tx_hash)
+        })
+    })();
+
+    // Map single result to all request IDs
+    match result {
+        Ok(tx_hash) => payloads.into_iter().map(|(id, _, _, _, _)| (id, Ok(tx_hash.clone()))).collect(),
+        Err(e) => {
+            nonce_cache.invalidate();
+            payloads.into_iter().map(|(id, _, _, _, _)| (id, Err(anyhow::anyhow!("batch resolve failed: {}", e)))).collect()
+        }
+    }
 }
 
 // ── WASM discovery & execution ──────────────────────────────────────────────
