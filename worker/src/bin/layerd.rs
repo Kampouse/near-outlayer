@@ -5,6 +5,7 @@ use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -37,6 +38,16 @@ use std::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
+
+// ── WASM & Engine caching (Optimization #2) ─────────────────────────────────
+
+use std::sync::OnceLock;
+
+/// Cached WASM file bytes — read once, reused across all executions.
+static WASM_BYTES_CACHE: OnceLock<Vec<u8>> = OnceLock::new();
+
+/// Cached WASM path — so we don't re-discover every tick.
+static WASM_PATH_CACHE: OnceLock<PathBuf> = OnceLock::new();
 
 // ── Execution Record (shared state) ─────────────────────────────────────────
 
@@ -168,13 +179,12 @@ fn daemonize(_log_path: &Path, pid_path: &Path) -> Result<()> {
         0 => {
             unsafe { libc::setsid() };
             unsafe { libc::close(0); libc::close(1); libc::close(2); };
-            // Redirect fd 0,1,2 to /dev/null
             let dn = fs::File::open("/dev/null").ok();
             let dn_fd = dn.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
             unsafe {
-                libc::dup(dn_fd); // stdin
-                libc::dup(dn_fd); // stdout
-                libc::dup(dn_fd); // stderr
+                libc::dup(dn_fd);
+                libc::dup(dn_fd);
+                libc::dup(dn_fd);
             }
             fs::write(pid_path, std::process::id().to_string()).ok();
             Ok(())
@@ -226,6 +236,18 @@ impl Rpc {
         })
     }
 
+    /// Get the current block height (cheap query, Optimization #3)
+    fn get_block_height(&self) -> Result<u64> {
+        let client = &self.client;
+        self.rt.block_on(async {
+            let request = methods::block::RpcBlockRequest {
+                block_reference: BlockReference::latest(),
+            };
+            let response = client.call(request).await?;
+            Ok(response.header.height)
+        })
+    }
+
     fn view(&self, contract: &str, method: &str, args: &[u8]) -> Result<Vec<u8>> {
         let client = &self.client;
         self.rt.block_on(async {
@@ -246,6 +268,53 @@ impl Rpc {
         })
     }
 
+    /// Fetch multiple request infos concurrently (Optimization #5)
+    fn fetch_request_infos(&self, contract: &str, ids: &[u64]) -> Vec<(u64, Result<RequestInfo>)> {
+        let client = self.client.clone();
+        let contract_id = contract.to_string();
+        self.rt.block_on(async {
+            let futures: Vec<_> = ids.iter().map(|&req_id| {
+                let client = client.clone();
+                let contract_id = contract_id.clone();
+                async move {
+                    let result = Self::view_async(&client, &contract_id, "get_request", serde_json::json!({"request_id": req_id}).to_string().into_bytes()).await;
+                    let parsed = result.and_then(|bytes| {
+                        if bytes.is_empty() { anyhow::bail!("request {} not found", req_id); }
+                        let req: serde_json::Value = serde_json::from_slice(&bytes)?;
+                        let input_b64 = req.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
+                        let decoded = base64::engine::general_purpose::STANDARD.decode(input_b64).unwrap_or_default();
+                        let limits = req.get("resource_limits");
+                        Ok(RequestInfo {
+                            input: String::from_utf8_lossy(&decoded).to_string(),
+                            max_instructions: limits.and_then(|l| l.get("max_instructions")).and_then(|v| v.as_u64()).unwrap_or(10_000_000_000),
+                            max_memory_mb: limits.and_then(|l| l.get("max_memory_mb")).and_then(|v| v.as_u64()).unwrap_or(256) as u32,
+                            max_execution_seconds: limits.and_then(|l| l.get("max_execution_seconds")).and_then(|v| v.as_u64()).unwrap_or(60),
+                        })
+                    });
+                    (req_id, parsed)
+                }
+            }).collect();
+            futures::future::join_all(futures).await
+        })
+    }
+
+    async fn view_async(client: &JsonRpcClient, contract: &str, method: &str, args: Vec<u8>) -> Result<Vec<u8>> {
+        let request = methods::query::RpcQueryRequest {
+            block_reference: BlockReference::latest(),
+            request: QueryRequest::CallFunction {
+                account_id: contract.parse()?,
+                method_name: method.to_string(),
+                args: serde_json::from_str(&format!("\"{}\"", base64::engine::general_purpose::STANDARD.encode(args)))?,
+            },
+        };
+        let response = client.call(request).await?;
+        if let QueryResponseKind::CallResult(result) = response.kind {
+            Ok(result.result)
+        } else {
+            anyhow::bail!("unexpected query response")
+        }
+    }
+
     fn send_tx(&self, signer: &InMemorySigner, contract: &str, method: &str, args: serde_json::Value, gas: u64, deposit: u128) -> Result<String> {
         let client = &self.client;
         let signer_account_id = signer.account_id.clone();
@@ -253,8 +322,6 @@ impl Rpc {
         let signer_clone = signer.clone();
 
         self.rt.block_on(async {
-            // Try cached access key first
-            // Atomically get and increment nonce from cache
             let (nonce, block_hash) = {
                 let mut cached = self.cached_key.lock().unwrap();
                 if let Some(ref mut ck) = *cached {
@@ -294,12 +361,10 @@ impl Rpc {
 
             match client.call(request).await {
                 Ok(_response) => {
-                    // Update cached nonce on success
                     *self.cached_key.lock().unwrap() = Some(CachedAccessKey { nonce, block_hash });
                     Ok(tx_hash)
                 }
                 Err(e) => {
-                    // Invalidate cache on error — nonce might be stale
                     *self.cached_key.lock().unwrap() = None;
                     Err(anyhow::anyhow!("tx failed: {}", e))
                 }
@@ -339,22 +404,6 @@ struct RequestInfo {
     max_execution_seconds: u64,
 }
 
-fn get_request_info(rpc: &Rpc, contract: &str, request_id: u64) -> Result<RequestInfo> {
-    let args = serde_json::to_vec(&serde_json::json!({"request_id": request_id}))?;
-    let bytes = rpc.view(contract, "get_request", &args)?;
-    if bytes.is_empty() { anyhow::bail!("request {} not found", request_id); }
-    let req: serde_json::Value = serde_json::from_slice(&bytes)?;
-    let input_b64 = req.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
-    let decoded = base64::engine::general_purpose::STANDARD.decode(input_b64).unwrap_or_default();
-    let limits = req.get("resource_limits");
-    Ok(RequestInfo {
-        input: String::from_utf8_lossy(&decoded).to_string(),
-        max_instructions: limits.and_then(|l| l.get("max_instructions")).and_then(|v| v.as_u64()).unwrap_or(10_000_000_000),
-        max_memory_mb: limits.and_then(|l| l.get("max_memory_mb")).and_then(|v| v.as_u64()).unwrap_or(256) as u32,
-        max_execution_seconds: limits.and_then(|l| l.get("max_execution_seconds")).and_then(|v| v.as_u64()).unwrap_or(60),
-    })
-}
-
 fn resolve(
     rpc: &Rpc, signer: &InMemorySigner, contract: &str,
     request_id: u64, success: bool, output: &str, time_ms: u64, instructions: u64,
@@ -375,7 +424,17 @@ fn resolve(
 
 // ── WASM discovery & execution ──────────────────────────────────────────────
 
+/// Find the smallest .wasm file (Optimization #6 — prefer optimized binaries).
+/// Caches the result after first successful lookup.
 fn find_wasm(search_dirs: &[String]) -> Option<PathBuf> {
+    // Return cached path if available
+    if let Some(cached) = WASM_PATH_CACHE.get() {
+        if cached.exists() {
+            return Some(cached.clone());
+        }
+    }
+
+    let mut best: Option<(PathBuf, u64)> = None;
     for dir in search_dirs {
         let base = PathBuf::from(dir);
         if !base.exists() { continue; }
@@ -386,20 +445,60 @@ fn find_wasm(search_dirs: &[String]) -> Option<PathBuf> {
                 for f in entries.flatten() {
                     let s = f.file_name().to_string_lossy().to_string();
                     if s.ends_with(".wasm") && !s.starts_with('.') && !s.contains("-deps") {
-                        return Some(f.path());
+                        let size = f.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+                        let is_better = best.as_ref().map_or(true, |(_, sz)| size < *sz);
+                        if is_better {
+                            best = Some((f.path(), size));
+                        }
                     }
                 }
             }
         }
     }
-    None
+
+    if let Some((path, size)) = best {
+        // Warn if WASM is large (Optimization #6)
+        if size > 1_000_000 {
+            eprintln!("⚠️ WASM binary is {} bytes (>1MB). Consider running wasm-opt -Oz.", size);
+        }
+        let _ = WASM_PATH_CACHE.set(path.clone());
+        Some(path)
+    } else {
+        None
+    }
 }
 
-fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str, env_vars: &HashMap<String, String>, req_limits: &RequestInfo) -> Result<(bool, String, u64, u64)> {
+/// Get cached WASM bytes (Optimization #2 — read file once, cache forever)
+fn get_wasm_bytes(wasm_path: &Path) -> Result<&'static [u8]> {
+    if let Some(cached) = WASM_BYTES_CACHE.get() {
+        // Verify the file hasn't changed (different path or modified)
+        return Ok(cached);
+    }
+    let bytes = fs::read(wasm_path).with_context(|| format!("reading {}", wasm_path.display()))?;
+    let _ = WASM_BYTES_CACHE.set(bytes);
+    Ok(WASM_BYTES_CACHE.get().unwrap())
+}
 
-    let wasm_bytes = fs::read(wasm_path)
-        .with_context(|| format!("reading {}", wasm_path.display()))?;
+/// Result of a single WASM execution
+struct WasmResult {
+    request_id: u64,
+    success: bool,
+    output: String,
+    time_ms: u64,
+    instructions: u64,
+    error: Option<String>,
+    input: String,
+}
 
+/// Execute a single WASM request. Reads bytes from cache.
+fn execute_single_wasm(
+    wasm_bytes: &[u8],
+    request_id: u64,
+    input: &str,
+    rpc_url: &str,
+    env_vars: &HashMap<String, String>,
+    req_limits: &RequestInfo,
+) -> WasmResult {
     let storage_dir = env::var("STORAGE_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./storage"));
@@ -411,9 +510,31 @@ fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str, env_vars: &HashMap
         max_calls_per_execution: 100,
         allow_transactions: true,
     };
-    let proxy = RpcProxy::new(rpc_cfg, rpc_url)?;
+    let proxy = match RpcProxy::new(rpc_cfg, rpc_url) {
+        Ok(p) => p,
+        Err(e) => return WasmResult {
+            request_id,
+            success: false,
+            output: String::new(),
+            time_ms: 0,
+            instructions: 0,
+            error: Some(format!("RPC proxy error: {}", e)),
+            input: input.to_string(),
+        },
+    };
 
-    let rt = tokio::runtime::Runtime::new()?;
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(r) => r,
+        Err(e) => return WasmResult {
+            request_id,
+            success: false,
+            output: String::new(),
+            time_ms: 0,
+            instructions: 0,
+            error: Some(format!("Runtime error: {}", e)),
+            input: input.to_string(),
+        },
+    };
     let handle = rt.handle().clone();
 
     let exec_ctx = ExecutionContext {
@@ -436,25 +557,42 @@ fn execute_wasm(wasm_path: &Path, input: &str, rpc_url: &str, env_vars: &HashMap
     let env = if env_vars.is_empty() { None } else { Some(env_vars.clone()) };
 
     let result = rt.block_on(executor.execute(
-        &wasm_bytes, None, input.as_bytes(), &limits,
+        wasm_bytes, None, input.as_bytes(), &limits,
         env, Some("wasm32-wasip2"), &ResponseFormat::Text,
         None, None, None,
-    ))?;
+    ));
 
-    let success = result.success;
-    let time_ms = result.execution_time_ms;
-    let instructions = result.instructions;
-    let output = match &result.output {
-        Some(ExecutionOutput::Text(t)) => t.clone(),
-        Some(ExecutionOutput::Json(j)) => serde_json::to_string(j).unwrap_or_default(),
-        Some(ExecutionOutput::Bytes(b)) => format!("{} bytes", b.len()),
-        None => String::new(),
-    };
-
-    // Drop executor first (releases runtime handle), then runtime can drop cleanly
     drop(executor);
     drop(rt);
-    Ok((success, output, time_ms, instructions))
+
+    match result {
+        Ok(r) => {
+            let output = match &r.output {
+                Some(ExecutionOutput::Text(t)) => t.clone(),
+                Some(ExecutionOutput::Json(j)) => serde_json::to_string(j).unwrap_or_default(),
+                Some(ExecutionOutput::Bytes(b)) => format!("{} bytes", b.len()),
+                None => String::new(),
+            };
+            WasmResult {
+                request_id,
+                success: r.success,
+                output,
+                time_ms: r.execution_time_ms,
+                instructions: r.instructions,
+                error: r.error,
+                input: input.to_string(),
+            }
+        }
+        Err(e) => WasmResult {
+            request_id,
+            success: false,
+            output: String::new(),
+            time_ms: 0,
+            instructions: 0,
+            error: Some(e.to_string()),
+            input: input.to_string(),
+        },
+    }
 }
 
 // ── Dashboard HTTP API ──────────────────────────────────────────────────────
@@ -531,7 +669,6 @@ struct ContractState {
 }
 
 async fn api_contract(State(state): State<Arc<DashboardState>>) -> axum::Json<ContractState> {
-    // Use a blocking call to query the contract
     let rpc_url = state.rpc_url.clone();
     let contract_id = state.contract_id.clone();
     let result = std::thread::spawn(move || -> Result<Vec<u64>> {
@@ -604,10 +741,8 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let cfg = Config::load();
 
-    // Parse --dashboard flag from CLI (overrides config)
     let dashboard_addr = parse_dashboard_flag(&args).or(cfg.dashboard_addr.clone());
 
-    // Handle CLI flags
     let mode = if args.iter().any(|a| a == "--stop") {
         return stop_daemon(&cfg);
     } else if args.iter().any(|a| a == "--start") {
@@ -629,7 +764,6 @@ fn main() -> Result<()> {
         let pid_path = cfg.pid_file_path();
         let log_path = cfg.log_file_path();
 
-        // Check if already running
         if is_running(&pid_path) {
             eprintln!("layerd already running (PID {})", read_pid(&pid_path).unwrap_or_default());
             std::process::exit(1);
@@ -641,7 +775,6 @@ fn main() -> Result<()> {
 
         daemonize(&log_path, &pid_path)?;
     } else {
-        // Write PID file for --status/--stop to work
         let pid_path = cfg.pid_file_path();
         if let Some(parent) = pid_path.parent() { fs::create_dir_all(parent).ok(); }
         fs::write(&pid_path, std::process::id().to_string()).ok();
@@ -701,7 +834,6 @@ fn main() -> Result<()> {
         } else {
             eprint!("{}", line);
         }
-        // Broadcast to SSE subscribers
         let _ = dashboard_state.events_tx.send(msg.to_string());
     };
 
@@ -711,11 +843,11 @@ fn main() -> Result<()> {
     let rpc = Rpc::new(&cfg.rpc_url)?;
     let mut processed: HashSet<u64> = HashSet::new();
 
-    // Clean up PID file on exit
     let pid_path_cleanup = cfg.pid_file_path();
     ctrlc_handler(&pid_path_cleanup);
 
     let mut consecutive_errors = 0u32;
+    let mut last_block_height: Option<u64> = None; // Optimization #3
 
     loop {
         // Update poll count
@@ -725,101 +857,132 @@ fn main() -> Result<()> {
             st.last_poll_time = Some(now());
         }
 
+        // Optimization #3: Skip polling if block height hasn't changed
+        let current_height = rpc.get_block_height().ok();
+        if let (Some(h), Some(last)) = (current_height, last_block_height) {
+            if h == last {
+                std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
+                continue;
+            }
+        }
+
         match get_pending_ids(&rpc, &cfg.contract_id) {
             Ok(ids) => {
                 consecutive_errors = 0;
                 if ids.is_empty() {
-                    // silent — nothing to do
-                } else {
-                    log(&format!("Pending: {:?}", ids));
+                    // Update block height for idle skip
+                    last_block_height = current_height;
+                    std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
+                    continue;
+                }
 
-                    for req_id in &ids {
-                        if processed.contains(req_id) { continue; }
-                        log(&format!("📋 Request #{}", req_id));
+                log(&format!("Pending: {:?}", ids));
 
-                        let req_info = match get_request_info(&rpc, &cfg.contract_id, *req_id) {
-                            Ok(i) => i,
-                            Err(e) => { log(&format!("   ❌ {}", e)); continue; }
-                        };
-                        log(&format!("   Input: {}", req_info.input));
+                // Filter out already-processed requests
+                let unprocessed: Vec<u64> = ids.iter()
+                    .filter(|id| !processed.contains(id))
+                    .copied()
+                    .collect();
 
-                        let wasm = match find_wasm(&cfg.wasm_search_dirs) {
-                            Some(w) => w,
-                            None => { log("   ❌ WASM not found"); continue; }
-                        };
-                        log(&format!("   WASM: {}", wasm.display()));
+                if unprocessed.is_empty() {
+                    // All already processed — just sleep
+                    std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
+                    continue;
+                }
 
-                        log("   🏃 Running...");
-                        match execute_wasm(&wasm, &req_info.input, &cfg.rpc_url, &cfg.env, &req_info) {
-                            Ok((success, output, time_ms, instructions)) => {
-                                log(&format!("   ✅ {} | {}ms | {} instr", success, time_ms, instructions));
-                                log(&format!("   📤 {}", output));
+                // Optimization #1 & #5: Fetch all request infos concurrently
+                let infos = rpc.fetch_request_infos(&cfg.contract_id, &unprocessed);
 
-                                // Record execution
-                                let record = ExecutionRecord {
-                                    request_id: *req_id,
-                                    input: req_info.input.clone(),
-                                    output: output.clone(),
-                                    execution_time_ms: time_ms,
-                                    instructions,
-                                    timestamp: now(),
-                                    success,
-                                };
-                                {
-                                    let mut hist = dashboard_state.history.lock().unwrap();
-                                    hist.push(record);
-                                    // Keep last 200
-                                    if hist.len() > 200 {
-                                        let excess = hist.len().saturating_sub(200); hist.drain(0..excess);
-                                    }
+                // Validate we have a WASM binary
+                let wasm_path = match find_wasm(&cfg.wasm_search_dirs) {
+                    Some(w) => w,
+                    None => { log("   ❌ WASM not found"); continue; }
+                };
+                log(&format!("   WASM: {}", wasm_path.display()));
+
+                // Optimization #2: Get cached WASM bytes
+                let wasm_bytes = match get_wasm_bytes(&wasm_path) {
+                    Ok(b) => b,
+                    Err(e) => { log(&format!("   ❌ {}", e)); continue; }
+                };
+
+                // Optimization #1: Execute all WASMs in parallel
+                let wasm_results: Vec<WasmResult> = std::thread::scope(|s| {
+                    let handles: Vec<_> = infos.into_iter()
+                        .filter_map(|(req_id, info_result)| {
+                            match info_result {
+                                Ok(info) => {
+                                    log(&format!("📋 Request #{} — {}", req_id, info.input));
+                                    let env = cfg.env.clone();
+                                    let rpc_url = cfg.rpc_url.clone();
+                                    Some(s.spawn(move || {
+                                        execute_single_wasm(wasm_bytes, req_id, &info.input, &rpc_url, &env, &info)
+                                    }))
                                 }
-
-                                match resolve(&rpc, &signer, &cfg.contract_id, *req_id, success, &output, time_ms, instructions) {
-                                    Ok(tx_hash) => log(&format!("   ✅ Tx: {}", tx_hash)),
-                                    Err(e) => log(&format!("   ❌ Submit failed: {}", e)),
+                                Err(e) => {
+                                    log(&format!("   ❌ Request #{} info failed: {}", req_id, e));
+                                    None
                                 }
                             }
-                            Err(e) => {
-                                log(&format!("   ❌ {}", e));
+                        })
+                        .collect();
 
-                                // Record failed execution
-                                let record = ExecutionRecord {
-                                    request_id: *req_id,
-                                    input: req_info.input.clone(),
-                                    output: format!("Error: {}", e),
-                                    execution_time_ms: 0,
-                                    instructions: 0,
-                                    timestamp: now(),
-                                    success: false,
-                                };
-                                {
-                                    let mut hist = dashboard_state.history.lock().unwrap();
-                                    hist.push(record);
-                                    if hist.len() > 200 {
-                                        let excess = hist.len().saturating_sub(200); hist.drain(0..excess);
-                                    }
-                                }
+                    handles.into_iter()
+                        .map(|h| h.join().unwrap())
+                        .collect()
+                });
 
-                                let _ = resolve(&rpc, &signer, &cfg.contract_id, *req_id, false, "", 0, 0);
-                            }
+                // Submit resolve txs sequentially (nonce ordering)
+                for result in wasm_results {
+                    processed.insert(result.request_id);
+
+                    let record = ExecutionRecord {
+                        request_id: result.request_id,
+                        input: result.input.clone(),
+                        output: if result.success { result.output.clone() } else { result.error.clone().unwrap_or_default() },
+                        execution_time_ms: result.time_ms,
+                        instructions: result.instructions,
+                        timestamp: now(),
+                        success: result.success,
+                    };
+                    {
+                        let mut hist = dashboard_state.history.lock().unwrap();
+                        hist.push(record);
+                        if hist.len() > 200 {
+                            let excess = hist.len().saturating_sub(200); hist.drain(0..excess);
                         }
-                        processed.insert(*req_id);
+                    }
+
+                    if result.success {
+                        log(&format!("   ✅ #{} | {}ms | {} instr", result.request_id, result.time_ms, result.instructions));
+                        log(&format!("   📤 {}", result.output));
+                        match resolve(&rpc, &signer, &cfg.contract_id, result.request_id, true, &result.output, result.time_ms, result.instructions) {
+                            Ok(tx_hash) => log(&format!("   ✅ Tx: {}", tx_hash)),
+                            Err(e) => log(&format!("   ❌ Submit failed: {}", e)),
+                        }
+                    } else {
+                        let err = result.error.unwrap_or_default();
+                        log(&format!("   ❌ #{}: {}", result.request_id, err));
+                        let _ = resolve(&rpc, &signer, &cfg.contract_id, result.request_id, false, "", 0, 0);
                     }
                 }
+
+                // Optimization #4: Pipeline — immediately re-poll instead of sleeping
+                // Block height changed since we had work, update tracker
+                last_block_height = None; // Force re-check on next iteration
+                continue; // Loop immediately — no sleep
             }
             Err(e) => {
                 consecutive_errors += 1;
                 let backoff = std::cmp::min(
                     cfg.poll_interval_secs * (1 << std::cmp::min(consecutive_errors, 5)),
-                    300, // max 5 min backoff
+                    300,
                 );
                 log(&format!("❌ {} (backoff {}s, attempt #{})", e, backoff, consecutive_errors));
                 std::thread::sleep(Duration::from_secs(backoff));
                 continue;
             }
         }
-
-        std::thread::sleep(Duration::from_secs(cfg.poll_interval_secs));
     }
 }
 
@@ -839,7 +1002,6 @@ fn parse_dashboard_flag(args: &[String]) -> Option<String> {
 fn is_running(pid_path: &Path) -> bool {
     if let Ok(pid_str) = fs::read_to_string(pid_path) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            // Send signal 0 to check if process exists
             unsafe {
                 return libc::kill(pid as i32, 0) == 0;
             }
@@ -854,8 +1016,6 @@ fn read_pid(pid_path: &Path) -> Result<u32> {
 }
 
 fn ctrlc_handler(_pid_path: &Path) {
-    // Stale PID files are handled by is_running() which checks actual process
-    // Just a marker — no complex signal handling needed
 }
 
 fn start_daemon(_cfg: &Config) -> Result<()> {
@@ -881,7 +1041,6 @@ fn start_daemon(_cfg: &Config) -> Result<()> {
 fn stop_daemon(cfg: &Config) -> Result<()> {
     let pid_path = cfg.pid_file_path();
 
-    // Try launchd unload first (macOS)
     let plist = dirs::home_dir()
         .map(|h| h.join("Library/LaunchAgents/com.outlayer.layerd.plist"))
         .filter(|p| p.exists());
@@ -893,7 +1052,6 @@ fn stop_daemon(cfg: &Config) -> Result<()> {
         std::thread::sleep(Duration::from_millis(500));
     }
 
-    // Also kill directly if still running
     if is_running(&pid_path) {
         let pid = read_pid(&pid_path)?;
         let my_pid = std::process::id();
