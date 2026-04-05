@@ -145,7 +145,7 @@ impl Default for Config {
 impl Config {
     fn load() -> Self {
         for dir in &[".", &dirs::home_dir().unwrap_or_default().join(".inlayer").display().to_string()] {
-            for name in &["layerd.config", "layerd.config.toml"] {
+            for name in &["inlayer.config", "inlayer.config.toml", "layerd.config", "layerd.config.toml"] {
                 let path = PathBuf::from(dir).join(name);
                 if let Ok(s) = std::fs::read_to_string(&path) {
                     if let Ok(cfg) = toml::from_str(&s) { return cfg; }
