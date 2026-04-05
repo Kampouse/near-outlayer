@@ -129,6 +129,26 @@ export default function WorkerDashboard() {
           </div>
         )}
 
+        {/* Live log */}
+        <div className="bg-gray-900 border border-gray-800 rounded-lg">
+          <div className="px-4 py-3 border-b border-gray-800">
+            <h2 className="text-sm font-bold font-mono text-gray-300">LIVE LOG</h2>
+          </div>
+          <div ref={logRef} className="p-4 max-h-48 overflow-y-auto font-mono text-xs text-gray-400 space-y-0.5">
+            {logs.length === 0 ? (
+              <div className="text-gray-600">Waiting for events...</div>
+            ) : logs.map((l, i) => (
+              <div key={i} className={
+                l.includes('❌') ? 'text-red-400' :
+                l.includes('✅') ? 'text-green-400' :
+                l.includes('🏃') ? 'text-yellow-400' : 'text-gray-400'
+              }>
+                <span className="text-gray-600">›</span> {l}
+              </div>
+            ))}
+          </div>
+        </div>
+
         {/* Recent executions */}
         <div className="bg-gray-900 border border-gray-800 rounded-lg">
           <div className="px-4 py-3 border-b border-gray-800 flex justify-between items-center">
@@ -171,26 +191,6 @@ export default function WorkerDashboard() {
                 )}
               </tbody>
             </table>
-          </div>
-        </div>
-
-        {/* Live log */}
-        <div className="bg-gray-900 border border-gray-800 rounded-lg">
-          <div className="px-4 py-3 border-b border-gray-800">
-            <h2 className="text-sm font-bold font-mono text-gray-300">LIVE LOG</h2>
-          </div>
-          <div ref={logRef} className="p-4 max-h-48 overflow-y-auto font-mono text-xs text-gray-400 space-y-0.5">
-            {logs.length === 0 ? (
-              <div className="text-gray-600">Waiting for events...</div>
-            ) : logs.map((l, i) => (
-              <div key={i} className={
-                l.includes('❌') ? 'text-red-400' :
-                l.includes('✅') ? 'text-green-400' :
-                l.includes('🏃') ? 'text-yellow-400' : 'text-gray-400'
-              }>
-                <span className="text-gray-600">›</span> {l}
-              </div>
-            ))}
           </div>
         </div>
       </div>
