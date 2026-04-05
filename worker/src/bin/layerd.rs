@@ -15,6 +15,7 @@ use near_crypto::{InMemorySigner, Signer};
 use near_jsonrpc_client::{methods, JsonRpcClient};
 use near_jsonrpc_primitives::types::query::QueryResponseKind;
 use near_primitives::action::{Action, FunctionCallAction};
+use near_primitives::hash::CryptoHash;
 use near_primitives::transaction::{Transaction, TransactionV0};
 use near_primitives::types::BlockReference;
 use near_primitives::views::QueryRequest;
@@ -205,9 +206,15 @@ fn load_signer(path: &str) -> Result<InMemorySigner> {
 
 // ── NEAR RPC ────────────────────────────────────────────────────────────────
 
+struct CachedAccessKey {
+    nonce: u64,
+    block_hash: CryptoHash,
+}
+
 struct Rpc {
     client: JsonRpcClient,
     rt: tokio::runtime::Runtime,
+    cached_key: std::sync::Mutex<Option<CachedAccessKey>>,
 }
 
 impl Rpc {
@@ -215,6 +222,7 @@ impl Rpc {
         Ok(Self {
             client: JsonRpcClient::connect(url),
             rt: tokio::runtime::Runtime::new()?,
+            cached_key: std::sync::Mutex::new(None),
         })
     }
 
@@ -245,25 +253,28 @@ impl Rpc {
         let signer_clone = signer.clone();
 
         self.rt.block_on(async {
-            let access_key_query = methods::query::RpcQueryRequest {
-                block_reference: BlockReference::latest(),
-                request: QueryRequest::ViewAccessKey {
-                    account_id: signer_account_id.clone(),
-                    public_key: signer_public_key.clone(),
-                },
+            // Try cached access key first
+            // Atomically get and increment nonce from cache
+            let (nonce, block_hash) = {
+                let mut cached = self.cached_key.lock().unwrap();
+                if let Some(ref mut ck) = *cached {
+                    ck.nonce += 1;
+                    (ck.nonce, ck.block_hash)
+                } else {
+                    drop(cached);
+                    let (fetched_nonce, hash) = self.fetch_access_key(&signer_account_id, &signer_public_key).await?;
+                    let nonce = fetched_nonce + 1;
+                    *self.cached_key.lock().unwrap() = Some(CachedAccessKey { nonce, block_hash: hash });
+                    (nonce, hash)
+                }
             };
-            let access_key_response = client.call(access_key_query).await?;
-            let (current_nonce, block_hash) = match access_key_response.kind {
-                QueryResponseKind::AccessKey(ak) => (ak.nonce, access_key_response.block_hash),
-                _ => anyhow::bail!("unexpected access key response"),
-            };
-
+            
             let args_bytes = serde_json::to_vec(&args)?;
 
             let transaction = TransactionV0 {
                 signer_id: signer_account_id,
                 public_key: signer_public_key,
-                nonce: current_nonce + 1,
+                nonce,
                 receiver_id: contract.parse()?,
                 block_hash,
                 actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
@@ -281,9 +292,34 @@ impl Rpc {
                 signed_transaction: signed_tx,
             };
 
-            let _response = client.call(request).await?;
-            Ok(tx_hash)
+            match client.call(request).await {
+                Ok(_response) => {
+                    // Update cached nonce on success
+                    *self.cached_key.lock().unwrap() = Some(CachedAccessKey { nonce, block_hash });
+                    Ok(tx_hash)
+                }
+                Err(e) => {
+                    // Invalidate cache on error — nonce might be stale
+                    *self.cached_key.lock().unwrap() = None;
+                    Err(anyhow::anyhow!("tx failed: {}", e))
+                }
+            }
         })
+    }
+
+    async fn fetch_access_key(&self, account_id: &near_primitives::types::AccountId, public_key: &near_crypto::PublicKey) -> Result<(u64, CryptoHash)> {
+        let request = methods::query::RpcQueryRequest {
+            block_reference: BlockReference::latest(),
+            request: QueryRequest::ViewAccessKey {
+                account_id: account_id.clone(),
+                public_key: public_key.clone(),
+            },
+        };
+        let response = self.client.call(request).await?;
+        match response.kind {
+            QueryResponseKind::AccessKey(ak) => Ok((ak.nonce, response.block_hash)),
+            _ => anyhow::bail!("unexpected access key response"),
+        }
     }
 }
 
