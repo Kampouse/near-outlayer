@@ -404,7 +404,7 @@ impl Rpc {
             let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer_clone));
             let tx_hash = format!("{:?}", signed_tx.get_hash());
 
-            let request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+            let request = methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
                 signed_transaction: signed_tx,
             };
 
@@ -432,7 +432,7 @@ impl Rpc {
                     };
                     let signed_retry = Transaction::V0(retry_tx).sign(&Signer::InMemory(signer_clone2));
                     let retry_hash = format!("{:?}", signed_retry.get_hash());
-                    match client.call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+                    match client.call(methods::broadcast_tx_async::RpcBroadcastTxAsyncRequest {
                         signed_transaction: signed_retry,
                     }).await {
                         Ok(_) => {
