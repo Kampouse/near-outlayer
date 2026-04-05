@@ -1010,8 +1010,8 @@ async fn api_call(
         let wasm_result = execute_single_wasm(&wasm_bytes, 0, &input_str, &rpc_url, &env, &info);
         let elapsed = start.elapsed();
 
-        // 2. Submit request_execution to blockchain using shared nonce cache
-        let mut transaction_hash = None;
+        // 2. Fire-and-forget: submit request_execution in background thread
+        //    User gets instant response, daemon resolves on-chain asynchronously
         if let (Some(signer), Some(contract_id), Some(nonce_cache)) = 
             (SHARED_SIGNER.get(), SHARED_CONTRACT_ID.get(), SHARED_NONCE_CACHE.get()) 
         {
@@ -1028,56 +1028,63 @@ async fn api_call(
                 "secrets_ref": null, "response_format": null, "payer_account_id": null, "params": null
             });
 
-            // Try to submit with shared nonce (3 retries)
-            for _attempt in 0..3 {
-                match nonce_cache.reserve_batch(1) {
-                    Ok((nonce, block_hash)) => {
-                        let tx = TransactionV0 {
-                            signer_id: signer.account_id.clone(),
-                            public_key: signer.public_key.clone(),
-                            nonce,
-                            receiver_id: contract_id.parse::<near_primitives::types::AccountId>().map_err(|e| { eprintln!("   /call contract_id parse error: {}", e); e })?,
-                            block_hash,
-                            actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                                method_name: "request_execution".to_string(),
-                                args: serde_json::to_vec(&args).unwrap_or_default(),
-                                gas: 300_000_000_000_000,
-                                deposit: 7_001_000_000_000_000_000_000u128,
-                            }))],
-                        };
-                        let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
-                        let client = JsonRpcClient::connect(&rpc_url);
-                        let rt = tokio::runtime::Runtime::new().ok();
-                        if let Some(rt) = rt {
+            // Spawn background thread — doesn't block the response
+            let rpc_url_bg = rpc_url.clone();
+            std::thread::spawn(move || {
+                for _attempt in 0..3 {
+                    match nonce_cache.reserve_batch(1) {
+                        Ok((nonce, block_hash)) => {
+                            let tx = TransactionV0 {
+                                signer_id: signer.account_id.clone(),
+                                public_key: signer.public_key.clone(),
+                                nonce,
+                                receiver_id: match contract_id.parse::<near_primitives::types::AccountId>() {
+                                    Ok(id) => id,
+                                    Err(e) => { eprintln!("   /call bg: contract_id parse error: {}", e); return; }
+                                },
+                                block_hash,
+                                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                                    method_name: "request_execution".to_string(),
+                                    args: serde_json::to_vec(&args).unwrap_or_default(),
+                                    gas: 300_000_000_000_000,
+                                    deposit: 7_001_000_000_000_000_000_000u128,
+                                }))],
+                            };
+                            let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
+                            let client = JsonRpcClient::connect(&rpc_url_bg);
+                            let rt = match tokio::runtime::Runtime::new() {
+                                Ok(r) => r,
+                                Err(_) => return,
+                            };
                             let send_result = rt.block_on(async {
                                 client.call(methods::send_tx::RpcSendTransactionRequest {
                                     signed_transaction: signed_tx,
-                                    wait_until: near_primitives::views::TxExecutionStatus::Final,
+                                    wait_until: near_primitives::views::TxExecutionStatus::ExecutedOptimistic,
                                 }).await
                             });
                             match send_result {
-                                Ok(resp) => {
-                                    transaction_hash = Some(format!("{:?}", resp));
-                                    eprintln!("   /call tx result: {:?}", resp);
-                                    break;
+                                Ok(_) => {
+                                    eprintln!("   /call bg: tx submitted");
+                                    return;
                                 }
                                 Err(e) => {
                                     let err_str = format!("{}", e);
-                                    eprintln!("   /call tx error: {}", err_str);
+                                    eprintln!("   /call bg: tx error: {}", err_str);
                                     if err_str.contains("InvalidNonce") {
                                         nonce_cache.invalidate();
                                         continue;
                                     }
-                                    transaction_hash = Some(format!("error: {}", err_str));
-                                    eprintln!("   /call send_tx error: {:?}", e);
-                                    break;
+                                    return;
                                 }
                             }
                         }
+                        Err(e) => {
+                            eprintln!("   /call bg: nonce error: {}", e);
+                            return;
+                        }
                     }
-                    Err(_) => break,
                 }
-            }
+            });
         }
 
         Ok(serde_json::json!({
@@ -1086,7 +1093,7 @@ async fn api_call(
             "error": wasm_result.error,
             "execution_time_ms": elapsed.as_millis() as u64,
             "instructions": wasm_result.instructions,
-            "transaction_hash": transaction_hash,
+            "transaction_hash": "submitting",
         }))
     }).await;
 
