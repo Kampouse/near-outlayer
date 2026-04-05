@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use crossbeam_channel::{Receiver, Sender};
+use crossbeam_channel::Receiver;
 
 use near_crypto::{InMemorySigner, Signer};
 use near_jsonrpc_client::{methods, JsonRpcClient};
@@ -62,10 +62,9 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 /// Shared compiled WASM cache — avoids re-JIT on every execution.
 static COMPILED_CACHE: OnceLock<Arc<std::sync::Mutex<CompiledCache>>> = OnceLock::new();
 
-fn init_compiled_cache() {
+fn init_compiled_cache(secret_key_bytes: [u8; 32]) {
     let home = dirs::home_dir().unwrap_or_default();
     let cache_dir = home.join(".inlayer").join("compiled_cache");
-    let secret_key_bytes: [u8; 32] = [0u8; 32]; // TODO: derive from worker key
     match CompiledCache::new(cache_dir, 500, &secret_key_bytes) {
         Ok(cache) => { COMPILED_CACHE.set(Arc::new(std::sync::Mutex::new(cache))).ok(); }
         Err(e) => eprintln!("⚠️ Compiled cache init failed: {}", e),
@@ -74,6 +73,18 @@ fn init_compiled_cache() {
 
 fn compiled_cache() -> Option<Arc<std::sync::Mutex<CompiledCache>>> {
     COMPILED_CACHE.get().cloned()
+}
+
+/// Derive a 32-byte key from the signer's secret key for compiled cache encryption.
+fn signer_key_bytes(signer: &InMemorySigner) -> [u8; 32] {
+    use sha2::Sha256;
+    // near_crypto::SecretKey wraps ed25519_dalek::SigningKey
+    let sk_str = signer.secret_key.to_string(); // "ed25519:base64..."
+    let b64 = sk_str.strip_prefix("ed25519:").unwrap_or(&sk_str);
+    let sk_bytes = base64::engine::general_purpose::STANDARD.decode(b64).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(&sk_bytes);
+    hasher.finalize().into()
 }
 
 // ── Execution Record (shared state) ─────────────────────────────────────────
@@ -116,6 +127,7 @@ struct DashboardStatusInner {
     start_time: std::time::Instant,
     poll_count: u64,
     last_poll_time: Option<String>,
+    last_block_height: Option<u64>,
     contract_id: String,
     account_id: String,
     rpc_url: String,
@@ -243,6 +255,20 @@ impl Default for Config {
 
 impl Config {
     fn load() -> Self {
+        // Check for explicit --config flag
+        let args: Vec<String> = env::args().collect();
+        for i in 0..args.len() {
+            if args[i] == "--config" && i + 1 < args.len() {
+                if let Ok(s) = std::fs::read_to_string(&args[i + 1]) {
+                    if let Ok(mut cfg) = toml::from_str::<Config>(&s) {
+                        cfg.expand_tildes();
+                        return cfg;
+                    }
+                }
+            }
+        }
+
+        // Search standard locations
         for dir in &[".", &dirs::home_dir().unwrap_or_default().join(".inlayer").display().to_string()] {
             for name in &["inlayer.config", "inlayer.config.toml", "layerd.config", "layerd.config.toml"] {
                 let path = PathBuf::from(dir).join(name);
@@ -349,15 +375,9 @@ fn load_signer(path: &str) -> Result<InMemorySigner> {
 
 // ── NEAR RPC ────────────────────────────────────────────────────────────────
 
-struct CachedAccessKey {
-    nonce: u64,
-    block_hash: CryptoHash,
-}
-
 struct Rpc {
     client: JsonRpcClient,
     rt: tokio::runtime::Runtime,
-    cached_key: std::sync::Mutex<Option<CachedAccessKey>>,
 }
 
 impl Rpc {
@@ -365,19 +385,6 @@ impl Rpc {
         Ok(Self {
             client: JsonRpcClient::connect(url),
             rt: tokio::runtime::Runtime::new()?,
-            cached_key: std::sync::Mutex::new(None),
-        })
-    }
-
-    /// Get the current block height (cheap query, Optimization #3)
-    fn get_block_height(&self) -> Result<u64> {
-        let client = &self.client;
-        self.rt.block_on(async {
-            let request = methods::block::RpcBlockRequest {
-                block_reference: BlockReference::latest(),
-            };
-            let response = client.call(request).await?;
-            Ok(response.header.height)
         })
     }
 
@@ -455,117 +462,6 @@ impl Rpc {
             anyhow::bail!("unexpected query response")
         }
     }
-
-    fn send_tx(&self, signer: &InMemorySigner, contract: &str, method: &str, args: serde_json::Value, gas: u64, deposit: u128) -> Result<String> {
-        let client = &self.client;
-        let signer_account_id = signer.account_id.clone();
-        let signer_public_key = signer.public_key.clone();
-        let signer_clone = signer.clone();
-        let signer_clone2 = signer.clone();
-        let contract_id: near_primitives::types::AccountId = contract.parse()?;
-        let contract_id2 = contract_id.clone();
-        let method_name = method.to_string();
-        let method_name2 = method_name.clone();
-        let args_bytes = serde_json::to_vec(&args)?;
-        let args_bytes2 = args_bytes.clone();
-        let signer_account_id2 = signer_account_id.clone();
-        let signer_public_key2 = signer_public_key.clone();
-
-        self.rt.block_on(async {
-            let (nonce, block_hash) = {
-                let mut cached = self.cached_key.lock().unwrap();
-                if let Some(ref mut ck) = *cached {
-                    ck.nonce += 1;
-                    (ck.nonce, ck.block_hash)
-                } else {
-                    drop(cached);
-                    let (fetched_nonce, hash) = self.fetch_access_key(&signer_account_id, &signer_public_key).await?;
-                    let nonce = fetched_nonce + 1;
-                    *self.cached_key.lock().unwrap() = Some(CachedAccessKey { nonce, block_hash: hash });
-                    (nonce, hash)
-                }
-            };
-            
-            let transaction = TransactionV0 {
-                signer_id: signer_account_id,
-                public_key: signer_public_key,
-                nonce,
-                receiver_id: contract_id,
-                block_hash,
-                actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                    method_name,
-                    args: args_bytes,
-                    gas,
-                    deposit,
-                }))],
-            };
-
-            let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer_clone));
-            let tx_hash = format!("{:?}", signed_tx.get_hash());
-
-            let request = methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
-                signed_transaction: signed_tx,
-            };
-
-            match client.call(request).await {
-                Ok(_response) => {
-                    *self.cached_key.lock().unwrap() = Some(CachedAccessKey { nonce, block_hash });
-                    Ok(tx_hash)
-                }
-                Err(e) if e.to_string().contains("InvalidNonce") => {
-                    // Re-fetch nonce from RPC and retry once
-                    let (fetched_nonce, hash) = self.fetch_access_key(&signer_account_id2, &signer_public_key2).await?;
-                    let retry_nonce = fetched_nonce + 1;
-                    let retry_tx = TransactionV0 {
-                        signer_id: signer_account_id2,
-                        public_key: signer_public_key2,
-                        nonce: retry_nonce,
-                        receiver_id: contract_id2,
-                        block_hash: hash,
-                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
-                            method_name: method_name2,
-                            args: args_bytes2,
-                            gas,
-                            deposit,
-                        }))],
-                    };
-                    let signed_retry = Transaction::V0(retry_tx).sign(&Signer::InMemory(signer_clone2));
-                    let retry_hash = format!("{:?}", signed_retry.get_hash());
-                    match client.call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
-                        signed_transaction: signed_retry,
-                    }).await {
-                        Ok(_) => {
-                            *self.cached_key.lock().unwrap() = Some(CachedAccessKey { nonce: retry_nonce, block_hash: hash });
-                            Ok(retry_hash)
-                        }
-                        Err(e2) => {
-                            *self.cached_key.lock().unwrap() = None;
-                            Err(anyhow::anyhow!("tx failed after nonce retry: {}", e2))
-                        }
-                    }
-                }
-                Err(e) => {
-                    *self.cached_key.lock().unwrap() = None;
-                    Err(anyhow::anyhow!("tx failed: {}", e))
-                }
-            }
-        })
-    }
-
-    async fn fetch_access_key(&self, account_id: &near_primitives::types::AccountId, public_key: &near_crypto::PublicKey) -> Result<(u64, CryptoHash)> {
-        let request = methods::query::RpcQueryRequest {
-            block_reference: BlockReference::latest(),
-            request: QueryRequest::ViewAccessKey {
-                account_id: account_id.clone(),
-                public_key: public_key.clone(),
-            },
-        };
-        let response = self.client.call(request).await?;
-        match response.kind {
-            QueryResponseKind::AccessKey(ak) => Ok((ak.nonce, response.block_hash)),
-            _ => anyhow::bail!("unexpected access key response"),
-        }
-    }
 }
 
 // ── Contract calls ──────────────────────────────────────────────────────────
@@ -584,10 +480,32 @@ struct RequestInfo {
     max_execution_seconds: u64,
 }
 
-/// Resolve a single request on-chain using a fresh runtime (thread-safe for parallel calls).
-fn resolve_standalone(
+/// Fetch a fresh nonce and block hash from the RPC.
+fn fetch_nonce_block(rpc_url: &str, signer: &InMemorySigner) -> Result<(u64, CryptoHash)> {
+    let client = JsonRpcClient::connect(rpc_url);
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(async {
+        let query = methods::query::RpcQueryRequest {
+            block_reference: BlockReference::latest(),
+            request: QueryRequest::ViewAccessKey {
+                account_id: signer.account_id.clone(),
+                public_key: signer.public_key.clone(),
+            },
+        };
+        let response = client.call(query).await?;
+        let nonce = match response.kind {
+            QueryResponseKind::AccessKey(ak) => ak.nonce + 1,
+            _ => anyhow::bail!("unexpected query response for access key"),
+        };
+        Ok((nonce, response.block_hash))
+    })
+}
+
+/// Submit a resolve tx using broadcast_tx_async (non-blocking) with retry fallback to broadcast_tx_commit.
+fn resolve_async(
     rpc_url: &str, signer: &InMemorySigner, contract: &str,
     request_id: u64, success: bool, output: &str, time_ms: u64, instructions: u64,
+    nonce: u64, block_hash: CryptoHash,
 ) -> Result<String> {
     let args = serde_json::json!({
         "request_id": request_id,
@@ -612,21 +530,6 @@ fn resolve_standalone(
     let args_bytes = serde_json::to_vec(&args)?;
 
     rt.block_on(async {
-        // Fetch fresh nonce
-        let query = methods::query::RpcQueryRequest {
-            block_reference: BlockReference::latest(),
-            request: QueryRequest::ViewAccessKey {
-                account_id: signer_account_id.clone(),
-                public_key: signer_public_key.clone(),
-            },
-        };
-        let response = client.call(query).await?;
-        let nonce = match response.kind {
-            QueryResponseKind::AccessKey(access_key) => access_key.nonce + 1,
-            _ => anyhow::bail!("unexpected query response"),
-        };
-        let block_hash = response.block_hash;
-
         let transaction = TransactionV0 {
             signer_id: signer_account_id,
             public_key: signer_public_key,
@@ -644,30 +547,48 @@ fn resolve_standalone(
         let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer_clone));
         let tx_hash = format!("{:?}", signed_tx.get_hash());
 
+        // broadcast_tx_commit — waits for inclusion (async silently drops txs)
         client.call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
             signed_transaction: signed_tx,
-        }).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+        }).await.map_err(|e| anyhow::anyhow!("broadcast failed: {}", e))?;
 
         Ok(tx_hash)
     })
 }
 
-fn resolve(
-    rpc: &Rpc, signer: &InMemorySigner, contract: &str,
-    request_id: u64, success: bool, output: &str, time_ms: u64, instructions: u64,
-) -> Result<String> {
-    let args = serde_json::json!({
-        "request_id": request_id,
-        "response": {
-            "success": success,
-            "output": {"Text": output},
-            "error": if success { serde_json::Value::Null } else { serde_json::Value::String("Execution failed".into()) },
-            "resources_used": {"instructions": instructions, "time_ms": time_ms},
-            "compilation_note": null,
-            "refund_usd": null,
+/// Batch-resolve multiple requests in parallel with pre-fetched nonces.
+fn resolve_batch_parallel(
+    rpc_url: &str, signer: &InMemorySigner, contract: &str,
+    payloads: Vec<(u64, bool, String, u64, u64)>,
+) -> Vec<(u64, Result<String>)> {
+    if payloads.is_empty() {
+        return Vec::new();
+    }
+
+    // Fetch one base nonce, then assign sequential nonces for each tx
+    let (base_nonce, block_hash) = match fetch_nonce_block(rpc_url, signer) {
+        Ok(r) => r,
+        Err(e) => {
+            return payloads.into_iter()
+                .map(|(id, _, _, _, _)| (id, Err(anyhow::anyhow!("nonce fetch failed: {}", e))))
+                .collect();
         }
-    });
-    rpc.send_tx(signer, contract, "resolve_execution", args, 100_000_000_000_000, 0)
+    };
+
+    std::thread::scope(|s| {
+        let handles: Vec<_> = payloads.into_iter().enumerate().map(|(i, (req_id, success, output, time_ms, instructions))| {
+            let nonce = base_nonce + i as u64;
+            s.spawn(move || {
+                let result = if success {
+                    resolve_async(rpc_url, signer, contract, req_id, true, &output, time_ms, instructions, nonce, block_hash)
+                } else {
+                    resolve_async(rpc_url, signer, contract, req_id, false, "", 0, 0, nonce, block_hash)
+                };
+                (req_id, result)
+            })
+        }).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    })
 }
 
 // ── WASM discovery & execution ──────────────────────────────────────────────
@@ -1045,6 +966,7 @@ fn main() -> Result<()> {
             start_time: std::time::Instant::now(),
             poll_count: 0,
             last_poll_time: None,
+            last_block_height: None,
             contract_id: cfg.contract_id.clone(),
             account_id: cfg.account_id.clone(),
             rpc_url: cfg.rpc_url.clone(),
@@ -1063,7 +985,7 @@ fn main() -> Result<()> {
 
     // ── Worker loop ─────────────────────────────────────────────────────
     let signer = load_signer(&cfg.key_path)?;
-    init_compiled_cache();
+    init_compiled_cache(signer_key_bytes(&signer));
     let is_daemon = mode == "daemon";
     let mut log_file = if is_daemon {
         let log_path = cfg.log_file_path();
@@ -1106,13 +1028,16 @@ fn main() -> Result<()> {
     loop {
         // Wait for next block notification from the watcher thread.
         // Height 0 = fallback tick (neardata unavailable), just poll via RPC.
-        let _watcher_height = match block_rx.recv_timeout(Duration::from_secs(cfg.poll_interval_secs * 3)) {
+        let watcher_height = match block_rx.recv_timeout(Duration::from_secs(cfg.poll_interval_secs * 3)) {
             Ok(h) => h,
-            Err(_) => {
-                // Channel timeout — neardata watcher may be stuck, poll anyway
-                0
-            }
+            Err(_) => 0,
         };
+
+        // Update dashboard with latest block height from watcher
+        if watcher_height > 0 {
+            let mut st = dashboard_state.status.lock().unwrap();
+            st.last_block_height = Some(watcher_height);
+        }
 
         // Update poll count
         {
@@ -1221,25 +1146,10 @@ fn main() -> Result<()> {
                     (result.request_id, result.success, output, result.time_ms, result.instructions)
                 }).collect();
 
-                // Submit resolve txs in parallel (each gets its own runtime — no contention)
-                let rpc_url = cfg.rpc_url.clone();
-                let contract_id = cfg.contract_id.clone();
-                let resolve_results: Vec<(u64, Result<String>)> = std::thread::scope(|s| {
-                    let handles: Vec<_> = resolve_payloads.into_iter().map(|(req_id, success, output, time_ms, instructions)| {
-                        let rpc_url = &rpc_url;
-                        let signer = &signer;
-                        let contract_id = &contract_id;
-                        s.spawn(move || {
-                            let tx_result = if success {
-                                resolve_standalone(rpc_url, signer, contract_id, req_id, true, &output, time_ms, instructions)
-                            } else {
-                                resolve_standalone(rpc_url, signer, contract_id, req_id, false, "", 0, 0)
-                            };
-                            (req_id, tx_result)
-                        })
-                    }).collect();
-                    handles.into_iter().map(|h| h.join().unwrap()).collect()
-                });
+                // Submit resolve txs in parallel with pre-batched nonces (non-blocking async)
+                let resolve_results = resolve_batch_parallel(
+                    &cfg.rpc_url, &signer, &cfg.contract_id, resolve_payloads,
+                );
 
                 // Log tx results
                 for (req_id, tx_result) in resolve_results {
