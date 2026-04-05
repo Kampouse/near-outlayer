@@ -1029,9 +1029,13 @@ async fn api_call(
             });
 
             // Spawn background thread — doesn't block the response
+            // Stagger by 100ms to avoid RPC connection contention
+            std::thread::sleep(std::time::Duration::from_millis(50));
             let rpc_url_bg = rpc_url.clone();
             std::thread::spawn(move || {
                 for _attempt in 0..3 {
+                    // Small delay between retries to avoid RPC contention
+                    if _attempt > 0 { std::thread::sleep(std::time::Duration::from_millis(200)); }
                     match nonce_cache.reserve_batch(1) {
                         Ok((nonce, block_hash)) => {
                             let tx = TransactionV0 {
@@ -1056,21 +1060,22 @@ async fn api_call(
                                 Ok(r) => r,
                                 Err(_) => return,
                             };
+                            // Use broadcast_tx_async (fire-and-forget) — no waiting
                             let send_result = rt.block_on(async {
                                 client.call(methods::send_tx::RpcSendTransactionRequest {
                                     signed_transaction: signed_tx,
-                                    wait_until: near_primitives::views::TxExecutionStatus::ExecutedOptimistic,
+                                    wait_until: near_primitives::views::TxExecutionStatus::None,
                                 }).await
                             });
                             match send_result {
-                                Ok(_) => {
+                                Ok(_resp) => {
                                     eprintln!("   /call bg: tx submitted");
                                     return;
                                 }
                                 Err(e) => {
                                     let err_str = format!("{}", e);
                                     eprintln!("   /call bg: tx error: {}", err_str);
-                                    if err_str.contains("InvalidNonce") {
+                                    if err_str.contains("InvalidNonce") || err_str.contains("InvalidTxError") {
                                         nonce_cache.invalidate();
                                         continue;
                                     }
