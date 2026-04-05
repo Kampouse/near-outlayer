@@ -49,6 +49,13 @@ static WASM_BYTES_CACHE: OnceLock<Vec<u8>> = OnceLock::new();
 /// Cached WASM path — so we don't re-discover every tick.
 static WASM_PATH_CACHE: OnceLock<PathBuf> = OnceLock::new();
 
+/// Shared tokio runtime for all WASM executions — avoids creating one per request.
+static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+fn shared_runtime() -> &'static tokio::runtime::Runtime {
+    SHARED_RUNTIME.get_or_init(|| tokio::runtime::Runtime::new().expect("failed to create shared runtime"))
+}
+
 // ── Execution Record (shared state) ─────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -570,18 +577,8 @@ fn execute_single_wasm(
         },
     };
 
-    let rt = match tokio::runtime::Runtime::new() {
-        Ok(r) => r,
-        Err(e) => return WasmResult {
-            request_id,
-            success: false,
-            output: String::new(),
-            time_ms: 0,
-            instructions: 0,
-            error: Some(format!("Runtime error: {}", e)),
-            input: input.to_string(),
-        },
-    };
+    // Use shared runtime instead of creating a new one per request
+    let rt = shared_runtime();
     let handle = rt.handle().clone();
 
     let exec_ctx = ExecutionContext {
@@ -610,7 +607,6 @@ fn execute_single_wasm(
     ));
 
     drop(executor);
-    drop(rt);
 
     match result {
         Ok(r) => {
@@ -1013,6 +1009,13 @@ fn main() -> Result<()> {
                         log(&format!("   ❌ #{}: {}", result.request_id, err));
                         let _ = resolve(&rpc, &signer, &cfg.contract_id, result.request_id, false, "", 0, 0);
                     }
+                }
+
+                // Prune processed set — keep only IDs > max_seen - 1000 to prevent unbounded growth
+                if processed.len() > 500 {
+                    let max_id = processed.iter().max().copied().unwrap_or(0);
+                    let min_keep = max_id.saturating_sub(1000);
+                    processed.retain(|&id| id > min_keep);
                 }
 
                 // Optimization #4: Pipeline — immediately re-poll instead of sleeping
