@@ -109,16 +109,6 @@ struct DaemonStatus {
     dashboard_addr: Option<String>,
 }
 
-/// Pending on-chain resolve, queued by /call after direct execution
-#[derive(Clone)]
-struct PendingResolve {
-    request_id: u64,
-    success: bool,
-    output: String,
-    time_ms: u64,
-    instructions: u64,
-}
-
 struct DashboardState {
     history: std::sync::Mutex<Vec<ExecutionRecord>>,
     status: std::sync::Mutex<DashboardStatusInner>,
@@ -129,8 +119,6 @@ struct DashboardState {
     search_paths: Vec<String>,
     env: HashMap<String, String>,
     signer: std::sync::Mutex<Option<InMemorySigner>>,
-    /// Queue of results from /call that need on-chain resolution
-    resolve_queue: std::sync::Mutex<Vec<PendingResolve>>,
 }
 
 #[derive(Debug)]
@@ -247,7 +235,7 @@ impl Rpc {
                     let parsed = result.and_then(|bytes| {
                         if bytes.is_empty() { anyhow::bail!("request {} not found", req_id); }
                         let req: serde_json::Value = serde_json::from_slice(&bytes)?;
-                        eprintln!("   📋 Raw request #{}: {}", req_id, &serde_json::to_string(&req).unwrap_or_default()[..200.min(serde_json::to_string(&req).unwrap_or_default().len())]);
+                        { let s = serde_json::to_string(&req).unwrap_or_default(); eprintln!("   📋 Raw request #{}: {}", req_id, &s[..s.len().min(200)]); }
                         let input_raw = req.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
                         let input_str = if input_raw.is_empty() {
                             String::new()
@@ -1048,9 +1036,10 @@ async fn api_call(
                         }))],
                     };
                     let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
+                    let rpc_url_bg = rpc_url.clone();
                     // Only send in background (HTTP latency ~300ms) — tx is already signed
                     std::thread::spawn(move || {
-                        let client = JsonRpcClient::connect("https://test.rpc.fastnear.com");
+                        let client = JsonRpcClient::connect(&rpc_url_bg);
                         let rt = match tokio::runtime::Runtime::new() {
                             Ok(r) => r,
                             Err(_) => return,
@@ -1697,7 +1686,6 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
         search_paths: daemon_cfg.search_paths.clone(),
         env: HashMap::new(),
         signer: std::sync::Mutex::new(None),
-        resolve_queue: std::sync::Mutex::new(Vec::new()),
     });
 
     if let Some(ref addr) = dashboard_addr {
