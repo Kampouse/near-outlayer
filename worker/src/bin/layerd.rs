@@ -602,10 +602,12 @@ fn resolve_one(
         let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer_clone));
         let tx_hash = format!("{:?}", signed_tx.get_hash());
 
-        // broadcast_tx_commit — reliable confirmation
-        client.call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+        // Use send_tx (modern replacement for broadcast_tx_commit)
+        // wait_until EXECUTED_OPTIMISTIC = included + receipts executed (same as old commit)
+        client.call(methods::send_tx::RpcSendTransactionRequest {
             signed_transaction: signed_tx,
-        }).await.map_err(|e| anyhow::anyhow!("broadcast failed: {}", e))?;
+            wait_until: near_primitives::views::TxExecutionStatus::ExecutedOptimistic,
+        }).await.map_err(|e| anyhow::anyhow!("send_tx failed: {}", e))?;
 
         Ok(tx_hash)
     })
