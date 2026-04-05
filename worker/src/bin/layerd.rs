@@ -501,14 +501,60 @@ fn fetch_nonce_block(rpc_url: &str, signer: &InMemorySigner) -> Result<(u64, Cry
     })
 }
 
-/// Submit a resolve tx using broadcast_tx_async (non-blocking) with retry fallback to broadcast_tx_commit.
-fn resolve_async(
+/// Cached nonce tracker — avoids re-fetching from RPC every batch.
+/// Auto-increments locally; re-fetches on InvalidNonce errors.
+struct NonceCache {
+    inner: std::sync::Mutex<NonceCacheInner>,
+    rpc_url: String,
+    signer: InMemorySigner,
+}
+
+struct NonceCacheInner {
+    nonce: Option<u64>,
+    block_hash: Option<CryptoHash>,
+}
+
+impl NonceCache {
+    fn new(rpc_url: String, signer: InMemorySigner) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(NonceCacheInner { nonce: None, block_hash: None }),
+            rpc_url,
+            signer,
+        }
+    }
+
+    /// Get N sequential nonces. Fetches from RPC on first call or after invalidation.
+    fn reserve_batch(&self, count: usize) -> Result<(u64, CryptoHash)> {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.nonce.is_none() {
+            drop(inner);
+            let (nonce, hash) = fetch_nonce_block(&self.rpc_url, &self.signer)?;
+            inner = self.inner.lock().unwrap();
+            inner.nonce = Some(nonce);
+            inner.block_hash = Some(hash);
+        }
+        let base = inner.nonce.unwrap();
+        let hash = inner.block_hash.unwrap();
+        inner.nonce = Some(base + count as u64);
+        Ok((base, hash))
+    }
+
+    /// Invalidate cache — next reserve_batch will re-fetch from RPC.
+    fn invalidate(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.nonce = None;
+        inner.block_hash = None;
+    }
+}
+
+/// Submit a single resolve tx with given nonce/block_hash.
+fn resolve_one(
     rpc_url: &str, signer: &InMemorySigner, contract: &str,
-    request_id: u64, success: bool, output: &str, time_ms: u64, instructions: u64,
+    req_id: u64, success: bool, output: &str, time_ms: u64, instructions: u64,
     nonce: u64, block_hash: CryptoHash,
 ) -> Result<String> {
     let args = serde_json::json!({
-        "request_id": request_id,
+        "request_id": req_id,
         "response": {
             "success": success,
             "output": {"Text": output},
@@ -547,7 +593,6 @@ fn resolve_async(
         let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer_clone));
         let tx_hash = format!("{:?}", signed_tx.get_hash());
 
-        // broadcast_tx_commit — waits for inclusion (async silently drops txs)
         client.call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
             signed_transaction: signed_tx,
         }).await.map_err(|e| anyhow::anyhow!("broadcast failed: {}", e))?;
@@ -556,39 +601,62 @@ fn resolve_async(
     })
 }
 
-/// Batch-resolve multiple requests in parallel with pre-fetched nonces.
-fn resolve_batch_parallel(
-    rpc_url: &str, signer: &InMemorySigner, contract: &str,
+/// Batch-resolve with cached nonces + parallel submission + InvalidNonce retry.
+fn resolve_batch(
+    nonce_cache: &NonceCache, signer: &InMemorySigner, contract: &str,
     payloads: Vec<(u64, bool, String, u64, u64)>,
 ) -> Vec<(u64, Result<String>)> {
     if payloads.is_empty() {
         return Vec::new();
     }
 
-    // Fetch one base nonce, then assign sequential nonces for each tx
-    let (base_nonce, block_hash) = match fetch_nonce_block(rpc_url, signer) {
-        Ok(r) => r,
-        Err(e) => {
-            return payloads.into_iter()
-                .map(|(id, _, _, _, _)| (id, Err(anyhow::anyhow!("nonce fetch failed: {}", e))))
-                .collect();
-        }
-    };
+    for attempt in 0..2 {
+        let (base_nonce, block_hash) = match nonce_cache.reserve_batch(payloads.len()) {
+            Ok(r) => r,
+            Err(e) => {
+                nonce_cache.invalidate();
+                return payloads.into_iter()
+                    .map(|(id, _, _, _, _)| (id, Err(anyhow::anyhow!("nonce fetch failed: {}", e))))
+                    .collect();
+            }
+        };
 
-    std::thread::scope(|s| {
-        let handles: Vec<_> = payloads.into_iter().enumerate().map(|(i, (req_id, success, output, time_ms, instructions))| {
-            let nonce = base_nonce + i as u64;
-            s.spawn(move || {
-                let result = if success {
-                    resolve_async(rpc_url, signer, contract, req_id, true, &output, time_ms, instructions, nonce, block_hash)
-                } else {
-                    resolve_async(rpc_url, signer, contract, req_id, false, "", 0, 0, nonce, block_hash)
-                };
-                (req_id, result)
-            })
-        }).collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    })
+        let rpc_url = &nonce_cache.rpc_url;
+
+        let results: Vec<(u64, Result<String>)> = std::thread::scope(|s| {
+            let handles: Vec<_> = payloads.iter().enumerate().map(|(i, (req_id, success, output, time_ms, instructions))| {
+                let nonce = base_nonce + i as u64;
+                let req_id = *req_id;
+                let success = *success;
+                let output = output.clone();
+                let time_ms = *time_ms;
+                let instructions = *instructions;
+                s.spawn(move || {
+                    let result = resolve_one(rpc_url, signer, contract, req_id, success, &output, time_ms, instructions, nonce, block_hash);
+                    (req_id, result)
+                })
+            }).collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let has_nonce_error = results.iter().any(|(_, r)| {
+            r.as_ref().err().map_or(false, |e| e.to_string().contains("InvalidNonce"))
+        });
+
+        if has_nonce_error {
+            nonce_cache.invalidate();
+            if attempt == 0 {
+                continue; // Retry with fresh nonce
+            }
+        }
+
+        return results;
+    }
+
+    // Should not reach here, but just in case
+    payloads.into_iter()
+        .map(|(id, _, _, _, _)| (id, Err(anyhow::anyhow!("nonce retry exhausted"))))
+        .collect()
 }
 
 // ── WASM discovery & execution ──────────────────────────────────────────────
@@ -1012,6 +1080,7 @@ fn main() -> Result<()> {
 
     let rpc = Rpc::new(&cfg.rpc_url)?;
     let mut processed: HashSet<u64> = HashSet::new();
+    let nonce_cache = NonceCache::new(cfg.rpc_url.clone(), signer.clone());
 
     let pid_path_cleanup = cfg.pid_file_path();
     ctrlc_handler(&pid_path_cleanup);
@@ -1146,9 +1215,9 @@ fn main() -> Result<()> {
                     (result.request_id, result.success, output, result.time_ms, result.instructions)
                 }).collect();
 
-                // Submit resolve txs in parallel with pre-batched nonces (non-blocking async)
-                let resolve_results = resolve_batch_parallel(
-                    &cfg.rpc_url, &signer, &cfg.contract_id, resolve_payloads,
+                // Submit resolve txs in parallel with cached nonces
+                let resolve_results = resolve_batch(
+                    &nonce_cache, &signer, &cfg.contract_id, resolve_payloads,
                 );
 
                 // Log tx results
