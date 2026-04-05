@@ -1001,6 +1001,7 @@ async fn api_call(
         let elapsed = start.elapsed();
 
         // 2. Pre-warm nonce upfront, pass to background thread. No contention, no retries.
+        let mut tx_hash = "no_signer".to_string();
         if let (Some(signer), Some(contract_id), Some(nonce_cache)) = 
             (SHARED_SIGNER.get(), SHARED_CONTRACT_ID.get(), SHARED_NONCE_CACHE.get()) 
         {
@@ -1038,6 +1039,7 @@ async fn api_call(
                         }))],
                     };
                     let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
+                    tx_hash = format!("{}", signed_tx.get_hash());
                     let rpc_url_bg = rpc_url.clone();
                     // Only send in background (HTTP latency ~300ms) — tx is already signed
                     std::thread::spawn(move || {
@@ -1065,7 +1067,7 @@ async fn api_call(
             "error": wasm_result.error,
             "execution_time_ms": elapsed.as_millis() as u64,
             "instructions": wasm_result.instructions,
-            "transaction_hash": "submitting",
+            "transaction_hash": tx_hash,
         }))
     }).await;
 
