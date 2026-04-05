@@ -48,6 +48,19 @@ fn shared_runtime() -> &'static tokio::runtime::Runtime {
 
 static COMPILED_CACHE: OnceLock<Arc<std::sync::Mutex<CompiledCache>>> = OnceLock::new();
 
+/// Global shared nonce cache - set once after signer loads, used by both /call and daemon loop
+/// Global signer for /call tx signing
+/// Global contract id
+
+/// Global shared nonce cache — set once after signer loads, used by both /call and daemon loop
+static SHARED_NONCE_CACHE: OnceLock<Arc<NonceCache>> = OnceLock::new();
+
+/// Global signer — set once after loading, used by /call for tx signing
+static SHARED_SIGNER: OnceLock<InMemorySigner> = OnceLock::new();
+
+/// Global contract id — set once after config loads
+static SHARED_CONTRACT_ID: OnceLock<String> = OnceLock::new();
+
 fn init_compiled_cache(secret_key_bytes: [u8; 32]) {
     let home = dirs::home_dir().unwrap_or_default();
     let cache_dir = home.join(".inlayer").join("compiled_cache");
@@ -957,61 +970,119 @@ async fn api_contract(State(state): State<Arc<DashboardState>>) -> axum::Json<Co
 
 async fn api_call(
     State(state): State<Arc<DashboardState>>,
-    axum::extract::Path((_owner, project)): axum::extract::Path<(String, String)>,
+    axum::extract::Path((_owner, _project)): axum::extract::Path<(String, String)>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
-    // Extract input from request body
     let input_str = match body.get("input") {
         Some(v) => v.as_str().unwrap_or("").to_string(),
         None => return (
             axum::http::StatusCode::BAD_REQUEST,
-            axum::Json(serde_json::json!({ "status": "failed", "error": "Missing 'input' field in request body" })),
+            axum::Json(serde_json::json!({ "status": "failed", "error": "Missing 'input' field" })),
         ),
     };
-
-    // Extract optional wasm_url hint for WASM resolution
     let wasm_url_hint = body.get("wasm_url").and_then(|v| v.as_str()).map(|s| s.to_string());
-
     let rpc_url = state.rpc_url.clone();
     let search_paths = state.search_paths.clone();
     let start = std::time::Instant::now();
 
-    // Execute WASM directly — no blockchain, no nonce issues
     let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
-        // Resolve WASM: try project name match, then wasm_url, then default
+        // 1. Resolve and execute WASM locally (fast)
         let source = if let Some(ref url) = wasm_url_hint {
             ParsedSource::WasmUrl { url: url.clone(), hash: String::new() }
         } else {
-            ParsedSource::Project { project_id: project.clone() }
+            ParsedSource::Unknown
         };
-
-        let temp_config = DaemonConfig { search_paths, ..Default::default() };
+        let temp_config = DaemonConfig { search_paths: search_paths.clone(), ..Default::default() };
         let wasm_bytes = resolve_wasm(&source, &temp_config)
-            .or_else(|| {
-                let default_config = DaemonConfig { search_paths: temp_config.search_paths.clone(), ..Default::default() };
-                find_wasm(&default_config).and_then(|p| fs::read(&p).ok())
-            })
-            .ok_or_else(|| anyhow::anyhow!("No WASM found for project: {}", project))?;
+            .or_else(|| find_wasm(&DaemonConfig { search_paths, ..Default::default() }).and_then(|p| fs::read(&p).ok()))
+            .ok_or_else(|| anyhow::anyhow!("No WASM found"))?;
 
         let info = RequestInfo {
             input: input_str.clone(),
             max_instructions: 10_000_000_000,
             max_memory_mb: 256,
             max_execution_seconds: 60,
-            source,
+            source: ParsedSource::Unknown,
         };
         let mut env = HashMap::new();
         env.insert("REQUEST_TYPE".into(), "http".into());
 
         let wasm_result = execute_single_wasm(&wasm_bytes, 0, &input_str, &rpc_url, &env, &info);
-
         let elapsed = start.elapsed();
+
+        // 2. Submit request_execution to blockchain using shared nonce cache
+        let mut transaction_hash = None;
+        if let (Some(signer), Some(contract_id), Some(nonce_cache)) = 
+            (SHARED_SIGNER.get(), SHARED_CONTRACT_ID.get(), SHARED_NONCE_CACHE.get()) 
+        {
+            let input_b64 = base64::engine::general_purpose::STANDARD.encode(input_str.as_bytes());
+            let source_json = if let ParsedSource::WasmUrl { ref url, .. } = source {
+                serde_json::json!({"WasmUrl": {"url": url, "hash": "0000000000000000000000000000000000000000000000000000000000000000", "build_target": "wasm32-wasip2"}})
+            } else {
+                serde_json::json!({"WasmUrl": {"url": "local", "hash": "0000000000000000000000000000000000000000000000000000000000000000", "build_target": "wasm32-wasip2"}})
+            };
+            let args = serde_json::json!({
+                "source": source_json,
+                "input_data": input_b64,
+                "resource_limits": {"max_instructions": 10_000_000_000u64, "max_memory_mb": 256u64, "max_execution_seconds": 60u64},
+                "secrets_ref": null, "response_format": null, "payer_account_id": null, "params": null
+            });
+
+            // Try to submit with shared nonce (3 retries)
+            for _attempt in 0..3 {
+                match nonce_cache.reserve_batch(1) {
+                    Ok((nonce, block_hash)) => {
+                        let tx = TransactionV0 {
+                            signer_id: signer.account_id.clone(),
+                            public_key: signer.public_key.clone(),
+                            nonce,
+                            receiver_id: contract_id.parse().unwrap_or_else(|_| signer.account_id.clone()),
+                            block_hash,
+                            actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                                method_name: "request_execution".to_string(),
+                                args: serde_json::to_vec(&args).unwrap_or_default(),
+                                gas: 300_000_000_000_000,
+                                deposit: 7_000_100_000_000_000_000_000u128,
+                            }))],
+                        };
+                        let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
+                        let client = JsonRpcClient::connect(&rpc_url);
+                        let rt = tokio::runtime::Runtime::new().ok();
+                        if let Some(rt) = rt {
+                            let send_result = rt.block_on(async {
+                                client.call(methods::send_tx::RpcSendTransactionRequest {
+                                    signed_transaction: signed_tx,
+                                    wait_until: near_primitives::views::TxExecutionStatus::ExecutedOptimistic,
+                                }).await
+                            });
+                            match send_result {
+                                Ok(resp) => {
+                                    transaction_hash = Some("submitted".to_string());
+                                    break;
+                                }
+                                Err(e) => {
+                                    let err_str = format!("{}", e);
+                                    if err_str.contains("InvalidNonce") {
+                                        nonce_cache.invalidate();
+                                        continue;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+
         Ok(serde_json::json!({
             "status": if wasm_result.success { "completed" } else { "failed" },
             "output": if wasm_result.success { serde_json::from_str::<serde_json::Value>(&wasm_result.output).unwrap_or_else(|_| serde_json::json!(wasm_result.output)) } else { serde_json::Value::Null },
             "error": wasm_result.error,
             "execution_time_ms": elapsed.as_millis() as u64,
             "instructions": wasm_result.instructions,
+            "transaction_hash": transaction_hash,
         }))
     }).await;
 
@@ -1675,6 +1746,10 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     let rpc = Rpc::new(&rpc_url)?;
     let mut processed: HashSet<u64> = HashSet::new();
     let nonce_cache = Arc::new(NonceCache::new(rpc_url.clone(), signer.clone()));
+    // Set globals for /call handler access
+    SHARED_NONCE_CACHE.set(nonce_cache.clone()).ok();
+    SHARED_SIGNER.set(signer.clone()).ok();
+    SHARED_CONTRACT_ID.set(daemon_cfg.contract_id.clone()).ok();
     let _pid_path_cleanup = daemon_cfg.pid_file_path();
     // ctrlc_handler(&_pid_path_cleanup); // TODO: add ctrlc handling
 
