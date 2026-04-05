@@ -584,6 +584,74 @@ struct RequestInfo {
     max_execution_seconds: u64,
 }
 
+/// Resolve a single request on-chain using a fresh runtime (thread-safe for parallel calls).
+fn resolve_standalone(
+    rpc_url: &str, signer: &InMemorySigner, contract: &str,
+    request_id: u64, success: bool, output: &str, time_ms: u64, instructions: u64,
+) -> Result<String> {
+    let args = serde_json::json!({
+        "request_id": request_id,
+        "response": {
+            "success": success,
+            "output": {"Text": output},
+            "error": if success { serde_json::Value::Null } else { serde_json::Value::String("Execution failed".into()) },
+            "resources_used": {"instructions": instructions, "time_ms": time_ms},
+            "compilation_note": null,
+            "refund_usd": null,
+        }
+    });
+
+    let client = JsonRpcClient::connect(rpc_url);
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let signer_account_id = signer.account_id.clone();
+    let signer_public_key = signer.public_key.clone();
+    let signer_clone = signer.clone();
+    let contract_id: near_primitives::types::AccountId = contract.parse()?;
+    let method_name = "resolve_execution".to_string();
+    let args_bytes = serde_json::to_vec(&args)?;
+
+    rt.block_on(async {
+        // Fetch fresh nonce
+        let query = methods::query::RpcQueryRequest {
+            block_reference: BlockReference::latest(),
+            request: QueryRequest::ViewAccessKey {
+                account_id: signer_account_id.clone(),
+                public_key: signer_public_key.clone(),
+            },
+        };
+        let response = client.call(query).await?;
+        let nonce = match response.kind {
+            QueryResponseKind::AccessKey(access_key) => access_key.nonce + 1,
+            _ => anyhow::bail!("unexpected query response"),
+        };
+        let block_hash = response.block_hash;
+
+        let transaction = TransactionV0 {
+            signer_id: signer_account_id,
+            public_key: signer_public_key,
+            nonce,
+            receiver_id: contract_id,
+            block_hash,
+            actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                method_name,
+                args: args_bytes,
+                gas: 100_000_000_000_000,
+                deposit: 0,
+            }))],
+        };
+
+        let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer_clone));
+        let tx_hash = format!("{:?}", signed_tx.get_hash());
+
+        client.call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
+            signed_transaction: signed_tx,
+        }).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+
+        Ok(tx_hash)
+    })
+}
+
 fn resolve(
     rpc: &Rpc, signer: &InMemorySigner, contract: &str,
     request_id: u64, success: bool, output: &str, time_ms: u64, instructions: u64,
@@ -1120,8 +1188,8 @@ fn main() -> Result<()> {
                         .collect()
                 });
 
-                // Submit resolve txs in parallel using broadcast_tx_commit
-                let resolve_results: Vec<(u64, Result<String>)> = wasm_results.into_iter().map(|result| {
+                // Log results and prepare resolve payloads
+                let resolve_payloads: Vec<(u64, bool, String, u64, u64)> = wasm_results.into_iter().map(|result| {
                     processed.insert(result.request_id);
 
                     let record = ExecutionRecord {
@@ -1149,14 +1217,29 @@ fn main() -> Result<()> {
                         log(&format!("   ❌ #{}: {}", result.request_id, err));
                     }
 
-                    let req_id = result.request_id;
-                    let tx_result = if result.success {
-                        resolve(&rpc, &signer, &cfg.contract_id, result.request_id, true, &result.output, result.time_ms, result.instructions)
-                    } else {
-                        resolve(&rpc, &signer, &cfg.contract_id, result.request_id, false, "", 0, 0)
-                    };
-                    (req_id, tx_result)
+                    let output = if result.success { result.output.clone() } else { String::new() };
+                    (result.request_id, result.success, output, result.time_ms, result.instructions)
                 }).collect();
+
+                // Submit resolve txs in parallel (each gets its own runtime — no contention)
+                let rpc_url = cfg.rpc_url.clone();
+                let contract_id = cfg.contract_id.clone();
+                let resolve_results: Vec<(u64, Result<String>)> = std::thread::scope(|s| {
+                    let handles: Vec<_> = resolve_payloads.into_iter().map(|(req_id, success, output, time_ms, instructions)| {
+                        let rpc_url = &rpc_url;
+                        let signer = &signer;
+                        let contract_id = &contract_id;
+                        s.spawn(move || {
+                            let tx_result = if success {
+                                resolve_standalone(rpc_url, signer, contract_id, req_id, true, &output, time_ms, instructions)
+                            } else {
+                                resolve_standalone(rpc_url, signer, contract_id, req_id, false, "", 0, 0)
+                            };
+                            (req_id, tx_result)
+                        })
+                    }).collect();
+                    handles.into_iter().map(|h| h.join().unwrap()).collect()
+                });
 
                 // Log tx results
                 for (req_id, tx_result) in resolve_results {
