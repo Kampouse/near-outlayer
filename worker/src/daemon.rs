@@ -1036,13 +1036,13 @@ async fn api_call(
                             signer_id: signer.account_id.clone(),
                             public_key: signer.public_key.clone(),
                             nonce,
-                            receiver_id: contract_id.parse().unwrap_or_else(|_| signer.account_id.clone()),
+                            receiver_id: contract_id.parse::<near_primitives::types::AccountId>().map_err(|e| { eprintln!("   /call contract_id parse error: {}", e); e })?,
                             block_hash,
                             actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
                                 method_name: "request_execution".to_string(),
                                 args: serde_json::to_vec(&args).unwrap_or_default(),
                                 gas: 300_000_000_000_000,
-                                deposit: 7_000_100_000_000_000_000_000u128,
+                                deposit: 7_001_000_000_000_000_000_000u128,
                             }))],
                         };
                         let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
@@ -1052,20 +1052,24 @@ async fn api_call(
                             let send_result = rt.block_on(async {
                                 client.call(methods::send_tx::RpcSendTransactionRequest {
                                     signed_transaction: signed_tx,
-                                    wait_until: near_primitives::views::TxExecutionStatus::ExecutedOptimistic,
+                                    wait_until: near_primitives::views::TxExecutionStatus::Final,
                                 }).await
                             });
                             match send_result {
                                 Ok(resp) => {
-                                    transaction_hash = Some("submitted".to_string());
+                                    transaction_hash = Some(format!("{:?}", resp));
+                                    eprintln!("   /call tx result: {:?}", resp);
                                     break;
                                 }
                                 Err(e) => {
                                     let err_str = format!("{}", e);
+                                    eprintln!("   /call tx error: {}", err_str);
                                     if err_str.contains("InvalidNonce") {
                                         nonce_cache.invalidate();
                                         continue;
                                     }
+                                    transaction_hash = Some(format!("error: {}", err_str));
+                                    eprintln!("   /call send_tx error: {:?}", e);
                                     break;
                                 }
                             }
