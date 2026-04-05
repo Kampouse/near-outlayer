@@ -693,7 +693,7 @@ fn main() -> Result<()> {
             Ok(ids) => {
                 consecutive_errors = 0;
                 if ids.is_empty() {
-                    log("No pending");
+                    // silent — nothing to do
                 } else {
                     log(&format!("Pending: {:?}", ids));
 
