@@ -96,6 +96,16 @@ struct DaemonStatus {
     dashboard_addr: Option<String>,
 }
 
+/// Pending on-chain resolve, queued by /call after direct execution
+#[derive(Clone)]
+struct PendingResolve {
+    request_id: u64,
+    success: bool,
+    output: String,
+    time_ms: u64,
+    instructions: u64,
+}
+
 struct DashboardState {
     history: std::sync::Mutex<Vec<ExecutionRecord>>,
     status: std::sync::Mutex<DashboardStatusInner>,
@@ -106,6 +116,8 @@ struct DashboardState {
     search_paths: Vec<String>,
     env: HashMap<String, String>,
     signer: std::sync::Mutex<Option<InMemorySigner>>,
+    /// Queue of results from /call that need on-chain resolution
+    resolve_queue: std::sync::Mutex<Vec<PendingResolve>>,
 }
 
 #[derive(Debug)]
@@ -1622,6 +1634,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
         search_paths: daemon_cfg.search_paths.clone(),
         env: HashMap::new(),
         signer: std::sync::Mutex::new(None),
+        resolve_queue: std::sync::Mutex::new(Vec::new()),
     });
 
     if let Some(ref addr) = dashboard_addr {
