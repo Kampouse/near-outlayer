@@ -545,6 +545,15 @@ impl NonceCache {
         inner.nonce = None;
         inner.block_hash = None;
     }
+
+    /// Inject a pre-fetched nonce into the cache if it's empty.
+    fn prefill(&self, nonce: u64, block_hash: CryptoHash) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.nonce.is_none() {
+            inner.nonce = Some(nonce);
+            inner.block_hash = Some(block_hash);
+        }
+    }
 }
 
 /// Submit a single resolve tx with given nonce/block_hash.
@@ -1136,8 +1145,17 @@ fn main() -> Result<()> {
                     continue;
                 }
 
-                // Optimization #1 & #5: Fetch all request infos concurrently
+                // Optimization: Fetch request infos (already concurrent)
                 let infos = rpc.fetch_request_infos(&cfg.contract_id, &unprocessed);
+
+                // Optimization: Pre-warm nonce cache while we set up WASM.
+                // This fetches nonce from RPC in the background so resolve_batch
+                // can use it immediately without waiting.
+                let nonce_prefetch = std::thread::spawn({
+                    let rpc_url = cfg.rpc_url.clone();
+                    let signer_clone = signer.clone();
+                    move || fetch_nonce_block(&rpc_url, &signer_clone)
+                });
 
                 if cfg.env.is_empty() {
                     log("⚠️ No env vars configured — WASM may not have NEAR_PRIVATE_KEY");
@@ -1214,6 +1232,11 @@ fn main() -> Result<()> {
                     let output = if result.success { result.output.clone() } else { String::new() };
                     (result.request_id, result.success, output, result.time_ms, result.instructions)
                 }).collect();
+
+                // Inject pre-fetched nonce into cache (pipelined with WASM exec)
+                if let Ok(Ok((nonce, hash))) = nonce_prefetch.join() {
+                    nonce_cache.prefill(nonce, hash);
+                }
 
                 // Submit resolve txs in parallel with cached nonces
                 let resolve_results = resolve_batch(
