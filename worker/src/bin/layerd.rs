@@ -602,6 +602,7 @@ fn resolve_one(
         let signed_tx = Transaction::V0(transaction).sign(&Signer::InMemory(signer_clone));
         let tx_hash = format!("{:?}", signed_tx.get_hash());
 
+        // broadcast_tx_commit — reliable confirmation
         client.call(methods::broadcast_tx_commit::RpcBroadcastTxCommitRequest {
             signed_transaction: signed_tx,
         }).await.map_err(|e| anyhow::anyhow!("broadcast failed: {}", e))?;
