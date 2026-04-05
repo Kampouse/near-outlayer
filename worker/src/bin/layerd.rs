@@ -936,6 +936,10 @@ fn main() -> Result<()> {
                 // Optimization #1 & #5: Fetch all request infos concurrently
                 let infos = rpc.fetch_request_infos(&cfg.contract_id, &unprocessed);
 
+                if cfg.env.is_empty() {
+                    log("⚠️ No env vars configured — WASM may not have NEAR_PRIVATE_KEY");
+                }
+
                 // Validate we have a WASM binary
                 let wasm_path = match find_wasm(&cfg.wasm_search_dirs) {
                     Some(w) => w,
