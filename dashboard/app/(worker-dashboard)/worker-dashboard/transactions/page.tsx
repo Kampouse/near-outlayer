@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import Link from 'next/link';
 import { fetchStatus } from '@/lib/worker-api';
 
@@ -100,49 +100,33 @@ async function fetchTxByHash(hash: string, rpcUrl: string): Promise<RpcTx | null
   } catch { return null; }
 }
 
-// Known tx hashes — updated by SSE and history
-const knownHashes: string[] = [];
-
 export default function TransactionsPage() {
   const [txs, setTxs] = useState<RpcTx[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [contractId, setContractId] = useState('');
   const [rpcUrl, setRpcUrl] = useState('');
-  const [lastBlock, setLastBlock] = useState(0);
-  const [autoRefresh, setAutoRefresh] = useState(true);
-  const seenRef = useRef<Set<string>>(new Set());
+  const [connected, setConnected] = useState(false);
 
-  useEffect(() => {
-    fetchStatus().then(s => {
-      setContractId(s.contract_id);
-      setRpcUrl(s.rpc_url);
-    }).catch(() => {});
-  }, []);
-
-  const load = useCallback(async () => {
-    if (!rpcUrl) return;
+  // Load initial history + fetch tx details for any hashes found
+  const loadHistory = useCallback(async (url: string) => {
     try {
-      const block: any = await rpcCall(rpcUrl, 'block', { finality: 'final' });
-      setLastBlock(block.header.height);
+      const apiBase = process.env.NEXT_PUBLIC_WORKER_API_URL || '/worker-api';
+      const historyRes = await fetch(`${apiBase}/history`);
+      if (!historyRes.ok) return;
+      const history = await historyRes.json() as any[];
 
-      // Collect hashes from daemon history
-      const hashes = new Set<string>(knownHashes);
-      try {
-        const historyRes = await fetch(`${process.env.NEXT_PUBLIC_WORKER_API_URL || '/worker-api'}/history`);
-        if (historyRes.ok) {
-          const history = await historyRes.json() as any[];
-          for (const rec of history) {
-            if (rec.resolve_tx_hash) hashes.add(rec.resolve_tx_hash);
-          }
-        }
-      } catch {}
+      // Collect tx hashes from history records
+      const hashes: string[] = [];
+      for (const rec of history) {
+        if (rec.resolve_tx_hash) hashes.push(rec.resolve_tx_hash);
+      }
 
-      const allHashes = [...hashes].filter(h => !seenRef.current.has(h)).concat([...seenRef.current]).slice(0, 50);
-      seenRef.current = new Set(allHashes);
+      if (hashes.length === 0) { setLoading(false); return; }
 
+      // Fetch details for each hash in parallel
       const results = await Promise.allSettled(
-        allHashes.map(h => fetchTxByHash(h, rpcUrl))
+        hashes.map(h => fetchTxByHash(h, url))
       );
 
       const validTxs = results
@@ -156,29 +140,48 @@ export default function TransactionsPage() {
     } finally {
       setLoading(false);
     }
-  }, [rpcUrl]);
+  }, []);
 
-  useEffect(() => {
-    load();
-    if (!autoRefresh) return;
-    const iv = setInterval(load, 8000);
-    return () => clearInterval(iv);
-  }, [load, autoRefresh]);
+  // Handle a new tx hash from SSE
+  const handleNewHash = useCallback(async (hash: string, url: string) => {
+    const tx = await fetchTxByHash(hash, url);
+    if (tx) {
+      setTxs(prev => {
+        if (prev.some(t => t.hash === hash)) return prev;
+        return [tx, ...prev].slice(0, 50);
+      });
+    }
+  }, []);
 
-  // SSE for real-time resolve events
+  // Init: get config + load initial history
   useEffect(() => {
-    const sseUrl = `${process.env.NEXT_PUBLIC_WORKER_API_URL || 'http://127.0.0.1:8082/api'}/stream`;
-    const es = new EventSource(sseUrl);
+    fetchStatus().then(s => {
+      setContractId(s.contract_id);
+      setRpcUrl(s.rpc_url);
+      loadHistory(s.rpc_url);
+    }).catch(() => setLoading(false));
+  }, [loadHistory]);
+
+  // SSE listener — reactive, no polling
+  useEffect(() => {
+    if (!rpcUrl) return;
+    const apiBase = process.env.NEXT_PUBLIC_WORKER_API_URL || 'http://127.0.0.1:8082/api';
+    const es = new EventSource(`${apiBase}/stream`);
+
+    es.onopen = () => setConnected(true);
+    es.onerror = () => setConnected(false);
+
     es.onmessage = (e) => {
-      const match = (e.data as string).match(/Tx:\s*(\w+)/);
-      if (match) {
-        knownHashes.unshift(match[1]);
-        load();
-      }
+      try {
+        const data = JSON.parse(e.data);
+        if (data.type === 'resolve' && data.tx_hash) {
+          handleNewHash(data.tx_hash, rpcUrl);
+        }
+      } catch {}
     };
-    es.onerror = () => {};
+
     return () => es.close();
-  }, [load]);
+  }, [rpcUrl, handleNewHash]);
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-100">
@@ -186,15 +189,10 @@ export default function TransactionsPage() {
         <div className="max-w-7xl mx-auto px-4 py-4 flex items-center gap-4">
           <Link href="/worker-dashboard" className="text-sm text-gray-400 hover:text-white">← Dashboard</Link>
           <h1 className="text-xl font-bold text-green-400 font-mono">On-Chain Transactions</h1>
-          <span className="ml-auto text-xs text-gray-500 font-mono">
-            Block #{lastBlock} | {contractId}
+          <span className={`ml-auto text-xs font-mono ${connected ? 'text-green-400' : 'text-gray-500'}`}>
+            {connected ? '● LIVE' : '○ DISCONNECTED'}
           </span>
-          <button
-            onClick={() => setAutoRefresh(!autoRefresh)}
-            className={`px-3 py-1 rounded text-xs font-mono ${autoRefresh ? 'bg-green-900/50 text-green-400' : 'bg-gray-800 text-gray-400'}`}
-          >
-            {autoRefresh ? '● LIVE' : '○ PAUSED'}
-          </button>
+          <span className="text-xs text-gray-600 font-mono">{contractId}</span>
         </div>
       </div>
 
@@ -206,7 +204,7 @@ export default function TransactionsPage() {
         )}
 
         {loading ? (
-          <div className="text-center py-12 text-gray-600 font-mono">Loading transactions...</div>
+          <div className="text-center py-12 text-gray-600 font-mono">Loading...</div>
         ) : txs.length === 0 ? (
           <div className="text-center py-12 text-gray-600 font-mono">
             No transactions yet. Submit a request to see it here.

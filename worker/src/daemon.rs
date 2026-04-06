@@ -905,11 +905,21 @@ async fn api_status(State(state): State<Arc<DashboardState>>) -> axum::Json<Daem
     })
 }
 
-async fn api_history(State(state): State<Arc<DashboardState>>) -> axum::Json<Vec<ExecutionRecord>> {
+async fn api_history(State(state): State<Arc<DashboardState>>) -> axum::Json<serde_json::Value> {
     let hist = state.history.lock().unwrap();
-    let mut records: Vec<ExecutionRecord> = hist.iter().rev().take(50).cloned().collect();
-    records.reverse();
-    axum::Json(records)
+    let records: Vec<serde_json::Value> = hist.iter().rev().take(50).map(|r| {
+        serde_json::json!({
+            "request_id": r.request_id,
+            "input": r.input,
+            "output": r.output,
+            "execution_time_ms": r.execution_time_ms,
+            "instructions": r.instructions,
+            "timestamp": r.timestamp,
+            "success": r.success,
+            "resolve_tx_hash": r.resolve_tx_hash,
+        })
+    }).collect();
+    axum::Json(serde_json::Value::Array(records.into_iter().rev().collect()))
 }
 
 async fn api_stream(
@@ -1835,33 +1845,26 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                     handles.into_iter().map(|h| h.join().unwrap()).collect()
                 });
 
-                let resolve_payloads: Vec<(u64, bool, String, u64, u64)> = wasm_results.into_iter().map(|result| {
-                    // NOTE: Don't insert into processed set yet — only mark after successful resolve
-                    let record = ExecutionRecord {
-                        request_id: result.request_id,
-                        input: result.input.clone(),
-                        output: if result.success { result.output.clone() } else { result.error.clone().unwrap_or_default() },
-                        execution_time_ms: result.time_ms,
-                        instructions: result.instructions,
-                        timestamp: now(),
-                        success: result.success,
-                        resolve_tx_hash: None, // updated after resolve
-                    };
-                    {
-                        let mut hist = dashboard_state.history.lock().unwrap();
-                        hist.push(record);
-                        if hist.len() > 200 { let excess = hist.len().saturating_sub(200); hist.drain(0..excess); }
-                    }
+                // Capture everything we need before consuming wasm_results
+                let wasm_captured: Vec<(u64, bool, String, String, u64, u64)> = wasm_results.into_iter().map(|result| {
                     if result.success {
                         log(&format!("   #{} | {}ms | {} instr", result.request_id, result.time_ms, result.instructions));
                         log(&format!("   {}", result.output));
                     } else {
-                        let err = result.error.unwrap_or_default();
+                        let err = result.error.clone().unwrap_or_default();
                         log(&format!("   #{}: {}", result.request_id, err));
                     }
-                    let output = if result.success { result.output.clone() } else { String::new() };
-                    (result.request_id, result.success, output, result.time_ms, result.instructions)
+                    let output = if result.success { result.output.clone() } else { result.error.unwrap_or_default() };
+                    (result.request_id, result.success, result.input.clone(), output, result.time_ms, result.instructions)
                 }).collect();
+
+                // Build resolve payloads from captured data
+                let resolve_payloads: Vec<(u64, bool, String, u64, u64)> = wasm_captured.iter().map(|(id, success, _input, output, time_ms, instructions)| {
+                    (*id, *success, output.clone(), *time_ms, *instructions)
+                }).collect();
+
+                // Save full results for history creation after resolve
+                let wasm_results_clone = wasm_captured;
 
                 if let Ok(Ok((nonce, hash))) = nonce_prefetch.join() {
                     nonce_cache.prefill(nonce, hash);
@@ -1869,23 +1872,44 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
                 let resolve_results = resolve_batch(&nonce_cache, &signer, &daemon_cfg.contract_id, resolve_payloads);
 
+                // Now create history records WITH resolve tx hashes, + broadcast SSE events
                 for (req_id, tx_result) in resolve_results {
+                    let resolve_hash = match &tx_result {
+                        Ok(h) => Some(h.clone()),
+                        Err(_) => None,
+                    };
+                    if let Some(wr) = wasm_results_clone.iter().find(|(id, _, _, _, _, _)| *id == req_id) {
+                        let record = ExecutionRecord {
+                            request_id: wr.0,
+                            input: wr.2.clone(),
+                            output: wr.3.clone(),
+                            execution_time_ms: wr.4,
+                            instructions: wr.5,
+                            timestamp: now(),
+                            success: wr.1,
+                            resolve_tx_hash: resolve_hash.clone(),
+                        };
+                        {
+                            let mut hist = dashboard_state.history.lock().unwrap();
+                            hist.push(record);
+                            if hist.len() > 200 { let excess = hist.len().saturating_sub(200); hist.drain(0..excess); }
+                        }
+                        // Broadcast SSE event with resolve info
+                        if let Some(ref hash) = resolve_hash {
+                            let _ = dashboard_state.events_tx.send(
+                                serde_json::to_string(&serde_json::json!({
+                                    "type": "resolve",
+                                    "request_id": req_id,
+                                    "tx_hash": hash,
+                                    "success": wr.1
+                                })).unwrap()
+                            );
+                            log(&format!("   Tx: {}", hash));
+                        }
+                    }
                     match tx_result {
-                        Ok(tx_hash) => {
-                            processed.insert(req_id);
-                            log(&format!("   Tx: {}", tx_hash));
-                            // Update the resolve_tx_hash in history
-                            {
-                                let mut hist = dashboard_state.history.lock().unwrap();
-                                if let Some(rec) = hist.iter_mut().find(|r| r.request_id == req_id) {
-                                    rec.resolve_tx_hash = Some(tx_hash);
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            // Don't mark as processed — will retry next poll
-                            log(&format!("   Submit #{} failed: {} (will retry)", req_id, e));
-                        },
+                        Ok(_) => { processed.insert(req_id); },
+                        Err(_) => {},
                     }
                 }
 
