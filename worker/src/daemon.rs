@@ -161,9 +161,22 @@ fn discover_neardata_height(base_url: &str) -> Option<u64> {
         .and_then(|s: &str| s.parse().ok())
 }
 
-fn spawn_block_watcher(network: &str, poll_interval_secs: u64) -> Receiver<u64> {
+fn get_rpc_block_height(rpc_url: &str) -> Option<u64> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let resp = client.post(rpc_url)
+        .json(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"status","params":[]}))
+        .send().ok()?;
+    let body: serde_json::Value = resp.json().ok()?;
+    body.get("result")?.get("sync_info")?.get("latest_block_height")?.as_u64()
+}
+
+fn spawn_block_watcher(network: &str, rpc_url: &str, poll_interval_secs: u64) -> Receiver<u64> {
     let (tx, rx) = crossbeam_channel::bounded(16);
     let base_url = neardata_base_url(network);
+    let rpc = rpc_url.to_string();
     std::thread::Builder::new()
         .name("block-watcher".into())
         .spawn(move || {
@@ -171,6 +184,10 @@ fn spawn_block_watcher(network: &str, poll_interval_secs: u64) -> Receiver<u64> 
             let mut neardata_failures: u32 = 0;
             loop {
                 let discovered = discover_neardata_height(&base_url);
+                // Only fall back to RPC block height if neardata fails multiple times
+                let discovered = discovered.or_else(|| {
+                    if neardata_failures > 2 { get_rpc_block_height(&rpc) } else { None }
+                });
                 match discovered {
                     Some(height) => {
                         neardata_failures = 0;
@@ -178,13 +195,15 @@ fn spawn_block_watcher(network: &str, poll_interval_secs: u64) -> Receiver<u64> 
                             last_height = Some(height);
                             if tx.send(height).is_err() { break; }
                         }
-                        std::thread::sleep(Duration::from_millis(600));
+                        // Use longer interval when polling RPC (avoid rate limits)
+                        std::thread::sleep(Duration::from_secs(poll_interval_secs));
                     }
                     None => {
                         neardata_failures += 1;
-                        if tx.send(0).is_err() { break; }
                         let backoff = if neardata_failures > 10 {
-                            std::cmp::min(poll_interval_secs * 2, 120)
+                            std::cmp::min(poll_interval_secs * 4, 300)
+                        } else if neardata_failures > 3 {
+                            poll_interval_secs * 2
                         } else {
                             poll_interval_secs
                         };
@@ -199,88 +218,106 @@ fn spawn_block_watcher(network: &str, poll_interval_secs: u64) -> Receiver<u64> 
 
 // ── RPC ─────────────────────────────────────────────────────────────────────
 
+struct RpcEndpoint {
+    url: String,
+    fails: std::sync::atomic::AtomicU32,
+}
+
 struct Rpc {
-    client: JsonRpcClient,
-    rt: tokio::runtime::Runtime,
+    endpoints: Vec<RpcEndpoint>,
+    client: reqwest::blocking::Client,
 }
 
 impl Rpc {
     fn new(url: &str) -> Result<Self> {
-        Ok(Self { client: JsonRpcClient::connect(url), rt: tokio::runtime::Runtime::new()? })
+        Ok(Self::from_urls(vec![url.to_string()]))
+    }
+
+    fn from_urls(urls: Vec<String>) -> Self {
+        Self {
+            endpoints: urls.into_iter().map(|u| RpcEndpoint { url: u, fails: std::sync::atomic::AtomicU32::new(0) }).collect(),
+            client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("failed to build HTTP client"),
+        }
+    }
+
+    fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
+        let mut indices: Vec<usize> = (0..self.endpoints.len()).collect();
+        indices.sort_by_key(|i| self.endpoints[*i].fails.load(std::sync::atomic::Ordering::Relaxed));
+
+        let mut last_err = String::new();
+        for i in indices {
+            let ep = &self.endpoints[i];
+            let resp = self.client.post(&ep.url)
+                .json(&serde_json::json!({"jsonrpc":"2.0","id":"1","method":method,"params":params}))
+                .send();
+            match resp {
+                Ok(r) => {
+                    if let Ok(v) = r.json::<serde_json::Value>() {
+                        if let Some(err) = v.get("error") {
+                            let msg = err.to_string();
+                            ep.fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if msg.contains("rate limit") || msg.contains("exceeded") || msg.contains("Too many") {
+                                eprintln!("   ⚠️ {} rate limited, trying next", ep.url);
+                            }
+                            last_err = msg;
+                            continue;
+                        }
+                        ep.fails.fetch_sub(ep.fails.load(std::sync::atomic::Ordering::Relaxed).min(1), std::sync::atomic::Ordering::Relaxed);
+                        return Ok(v["result"].clone());
+                    }
+                }
+                Err(e) => {
+                    ep.fails.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    last_err = e.to_string();
+                }
+            }
+        }
+        anyhow::bail!("all RPCs failed: {}", last_err)
     }
 
     fn view(&self, contract: &str, method: &str, args: &[u8]) -> Result<Vec<u8>> {
-        let client = &self.client;
-        self.rt.block_on(async {
-            let request = methods::query::RpcQueryRequest {
-                block_reference: BlockReference::latest(),
-                request: QueryRequest::CallFunction {
-                    account_id: contract.parse()?,
-                    method_name: method.to_string(),
-                    args: serde_json::from_str(&format!("\"{}\"", base64::engine::general_purpose::STANDARD.encode(args)))?,
-                },
-            };
-            let response = client.call(request).await?;
-            if let QueryResponseKind::CallResult(result) = response.kind { Ok(result.result) }
-            else { anyhow::bail!("unexpected query response") }
-        })
+        let args_b64 = base64::engine::general_purpose::STANDARD.encode(args);
+        let result = self.call("query", serde_json::json!({
+            "request_type": "call_function",
+            "finality": "final",
+            "account_id": contract,
+            "method_name": method,
+            "args_base64": args_b64
+        }))?;
+        let bytes: Vec<u8> = serde_json::from_value(result["result"].clone()).unwrap_or_default();
+        Ok(bytes)
     }
 
     fn fetch_request_infos(&self, contract: &str, ids: &[u64]) -> Vec<(u64, Result<RequestInfo>)> {
-        let client = self.client.clone();
-        let contract_id = contract.to_string();
-        self.rt.block_on(async {
-            let futures: Vec<_> = ids.iter().map(|&req_id| {
-                let client = client.clone();
-                let contract_id = contract_id.clone();
-                async move {
-                    let result = Self::view_async(&client, &contract_id, "get_request", serde_json::json!({"request_id": req_id}).to_string().into_bytes()).await;
-                    let parsed = result.and_then(|bytes| {
-                        if bytes.is_empty() { anyhow::bail!("request {} not found", req_id); }
-                        let req: serde_json::Value = serde_json::from_slice(&bytes)?;
-                        { let s = serde_json::to_string(&req).unwrap_or_default(); eprintln!("   📋 Raw request #{}: {}", req_id, &s[..s.len().min(200)]); }
-                        let input_raw = req.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
-                        let input_str = if input_raw.is_empty() {
-                            String::new()
-                        } else {
-                            match base64::engine::general_purpose::STANDARD.decode(input_raw) {
-                                Ok(decoded) if !decoded.is_empty() => String::from_utf8_lossy(&decoded).to_string(),
-                                _ => input_raw.to_string(),
-                            }
-                        };
-                        let limits = req.get("resource_limits");
-
-                        // Parse source from contract request
-                        let source = parse_source(&req);
-                        eprintln!("   📦 Parsed source: {:?}", source);
-
-                        Ok(RequestInfo {
-                            input: input_str,
-                            max_instructions: limits.and_then(|l| l.get("max_instructions")).and_then(|v| v.as_u64()).unwrap_or(10_000_000_000),
-                            max_memory_mb: limits.and_then(|l| l.get("max_memory_mb")).and_then(|v| v.as_u64()).unwrap_or(256) as u32,
-                            max_execution_seconds: limits.and_then(|l| l.get("max_execution_seconds")).and_then(|v| v.as_u64()).unwrap_or(60),
-                            source,
-                        })
-                    });
-                    (req_id, parsed)
-                }
-            }).collect();
-            futures::future::join_all(futures).await
-        })
-    }
-
-    async fn view_async(client: &JsonRpcClient, contract: &str, method: &str, args: Vec<u8>) -> Result<Vec<u8>> {
-        let request = methods::query::RpcQueryRequest {
-            block_reference: BlockReference::latest(),
-            request: QueryRequest::CallFunction {
-                account_id: contract.parse()?,
-                method_name: method.to_string(),
-                args: serde_json::from_str(&format!("\"{}\"", base64::engine::general_purpose::STANDARD.encode(args)))?,
-            },
-        };
-        let response = client.call(request).await?;
-        if let QueryResponseKind::CallResult(result) = response.kind { Ok(result.result) }
-        else { anyhow::bail!("unexpected query response") }
+        ids.iter().map(|&req_id| {
+            let result = self.view(contract, "get_request", serde_json::json!({"request_id": req_id}).to_string().as_bytes())
+                .and_then(|bytes| {
+                    if bytes.is_empty() { anyhow::bail!("request {} not found", req_id); }
+                    let req: serde_json::Value = serde_json::from_slice(&bytes)?;
+                    let input_raw = req.get("input_data").and_then(|v| v.as_str()).unwrap_or("");
+                    let input_str = if input_raw.is_empty() {
+                        String::new()
+                    } else {
+                        match base64::engine::general_purpose::STANDARD.decode(input_raw) {
+                            Ok(decoded) if !decoded.is_empty() => String::from_utf8_lossy(&decoded).to_string(),
+                            _ => input_raw.to_string(),
+                        }
+                    };
+                    let limits = req.get("resource_limits");
+                    let source = parse_source(&req);
+                    Ok(RequestInfo {
+                        input: input_str,
+                        max_instructions: limits.and_then(|l| l.get("max_instructions")).and_then(|v| v.as_u64()).unwrap_or(10_000_000_000),
+                        max_memory_mb: limits.and_then(|l| l.get("max_memory_mb")).and_then(|v| v.as_u64()).unwrap_or(256) as u32,
+                        max_execution_seconds: limits.and_then(|l| l.get("max_execution_seconds")).and_then(|v| v.as_u64()).unwrap_or(60),
+                        source,
+                    })
+                });
+            (req_id, result)
+        }).collect()
     }
 }
 
@@ -1516,12 +1553,23 @@ impl DaemonConfig {
         }
     }
 
-    fn rpc_url(&self) -> String {
+    fn rpc_urls(&self) -> Vec<String> {
         match self.network.as_str() {
-            "mainnet" => "https://rpc.mainnet.near.org".to_string(),
-            "testnet" => "https://test.rpc.fastnear.com".to_string(),
-            other => format!("https://rpc.{}.near.org", other),
+            "mainnet" => vec![
+                "https://rpc.mainnet.near.org".into(),
+                "https://near.lava.build".into(),
+            ],
+            "testnet" => vec![
+                "https://rpc.testnet.fastnear.com".into(),
+                "https://neart.lava.build".into(),
+                "https://near-testnet.gateway.tatum.io".into(),
+            ],
+            other => vec![format!("https://rpc.{}.near.org", other)],
         }
+    }
+
+    fn rpc_url(&self) -> String {
+        self.rpc_urls().into_iter().next().unwrap()
     }
 
     fn pid_file_path(&self) -> PathBuf {
@@ -1744,7 +1792,9 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     log(&format!("inlayer daemon started — Contract: {} Account: {} RPC: {}",
         daemon_cfg.contract_id, daemon_cfg.account_id, rpc_url));
 
-    let rpc = Rpc::new(&rpc_url)?;
+    let rpc_urls = daemon_cfg.rpc_urls();
+    eprintln!("   RPC pool:   {} endpoints", rpc_urls.len());
+    let rpc = Rpc::from_urls(rpc_urls);
     let mut processed: HashSet<u64> = HashSet::new();
     let nonce_cache = Arc::new(NonceCache::new(rpc_url.clone(), signer.clone()));
     // Set globals for /call handler access
@@ -1762,16 +1812,24 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
         std::process::exit(0);
     }).ok();
 
-    let block_rx = spawn_block_watcher(&daemon_cfg.network, daemon_cfg.poll_interval_secs);
+    let block_rx = spawn_block_watcher(&daemon_cfg.network, &rpc_url, daemon_cfg.poll_interval_secs);
     log("Block watcher started (neardata.xyz event-driven polling)");
 
     let mut consecutive_errors = 0u32;
+    let mut last_rpc_poll = std::time::Instant::now();
+    let min_rpc_interval = Duration::from_secs(daemon_cfg.poll_interval_secs.max(60));
 
     loop {
-        let watcher_height = match block_rx.recv_timeout(Duration::from_secs(daemon_cfg.poll_interval_secs * 3)) {
+        let watcher_height = match block_rx.recv_timeout(min_rpc_interval) {
             Ok(h) => h,
             Err(_) => 0,
         };
+
+        // Rate-limit RPC polling: never hit RPC more than once per min_rpc_interval
+        let elapsed = last_rpc_poll.elapsed();
+        if elapsed < min_rpc_interval {
+            std::thread::sleep(min_rpc_interval - elapsed);
+        }
 
         if watcher_height > 0 {
             let mut st = dashboard_state.status.lock().unwrap();
