@@ -62,6 +62,8 @@ static SHARED_SIGNER: OnceLock<InMemorySigner> = OnceLock::new();
 static SHARED_CONTRACT_ID: OnceLock<String> = OnceLock::new();
 /// Global deposit amount in yoctoNEAR — set once after config loads
 static SHARED_DEPOSIT_YOCTO: OnceLock<u128> = OnceLock::new();
+/// Used payment receipts (replay protection) for /execute endpoint
+static USED_RECEIPTS: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
 
 fn init_compiled_cache(secret_key_bytes: [u8; 32]) {
     let home = dirs::home_dir().unwrap_or_default();
@@ -1111,19 +1113,109 @@ async fn api_execute(
         Some(tx_hash) => tx_hash,
     };
 
-    // Step 2: Verify payment on-chain
-    // For now, we trust the receipt (on-chain verification can be added later)
-    // TODO: Query intents.near to verify the payment actually happened
-    let payment_verified = true;
+    // Step 2: Check replay (same tx hash can't be used twice)
+    {
+        let used = USED_RECEIPTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let set = used.lock().unwrap();
+        if set.contains(&receipt) {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "receipt_already_used",
+                    "message": "This payment receipt has already been redeemed",
+                })),
+            );
+        }
+    } // end replay check
+
+    // Step 3: Verify payment on-chain via RPC EXPERIMENTAL_tx_status
+    let rpc_url = state.rpc_url.clone();
+    let contract_id = state.contract_id.clone();
+    let receipt_for_spawn = receipt.clone();
+    let verification = tokio::task::spawn_blocking(move || -> Result<(bool, String)> {
+        // Use simple reqwest to call EXPERIMENTAL_tx_status
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?;
+
+        let resp = client.post(&rpc_url)
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": "1",
+                "method": "EXPERIMENTAL_tx_status",
+                "params": [receipt_for_spawn, contract_id]
+            }))
+            .send();
+
+        match resp {
+            Ok(r) => {
+                let body: serde_json::Value = r.json()?;
+                if let Some(error) = body.get("error") {
+                    return Ok((false, format!("TX not found: {}", error["message"])));
+                }
+                let result = body.get("result").cloned().unwrap_or_default();
+
+                // Check transaction status
+                let status = result.get("status").cloned().unwrap_or_default();
+                if status.get("Failure").is_some() {
+                    return Ok((false, "Transaction failed on-chain".to_string()));
+                }
+
+                // Check for Transfer/FunctionCall actions
+                let tx = result.get("transaction").cloned().unwrap_or_default();
+                let actions = tx.get("actions").cloned().unwrap_or_default();
+                if let Some(actions_arr) = actions.as_array() {
+                    for action in actions_arr {
+                        // Direct NEAR transfer
+                        if let Some(transfer) = action.get("Transfer") {
+                            let deposit_str = transfer.get("deposit").and_then(|d| d.as_str()).unwrap_or("0");
+                            let deposit_yocto: u128 = deposit_str.parse().unwrap_or(0);
+                            let deposit_near = deposit_yocto as f64 / 1e24;
+                            if deposit_near >= 0.001 {
+                                return Ok((true, format!("{:.6} NEAR", deposit_near)));
+                            }
+                        }
+                        // FunctionCall (could be ft_transfer_call for Intents)
+                        if let Some(fc) = action.get("FunctionCall") {
+                            let method = fc.get("method_name").and_then(|m| m.as_str()).unwrap_or("");
+                            if method == "ft_transfer_call" || method == "ft_transfer" {
+                                return Ok((true, "intents transfer".to_string()));
+                            }
+                            // Also accept request_execution as payment (contract deposit)
+                            if method == "request_execution" {
+                                return Ok((true, "contract execution deposit".to_string()));
+                            }
+                        }
+                    }
+                }
+
+                Ok((false, "No valid payment action found in transaction".to_string()))
+            }
+            Err(e) => Ok((false, format!("RPC request failed: {}", e))),
+        }
+    }).await;
+
+    let (payment_verified, verify_msg) = match verification {
+        Ok(Ok((verified, msg))) => (verified, msg),
+        Ok(Err(e)) => (false, e.to_string()),
+        Err(e) => (false, e.to_string()),
+    };
 
     if !payment_verified {
         return (
             axum::http::StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({
                 "error": "payment_verification_failed",
-                "message": "Could not verify payment receipt",
+                "message": verify_msg,
             })),
         );
+    }
+
+    // Mark receipt as used (replay protection)
+    {
+        let used = USED_RECEIPTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let mut set = used.lock().unwrap();
+        set.insert(receipt.clone());
     }
 
     // Step 3: Execute WASM
