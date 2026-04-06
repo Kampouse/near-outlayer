@@ -47,6 +47,7 @@ export default function WorkerDashboard() {
   const navLinks = [
     { href: '/worker-dashboard', label: 'Overview', active: true },
     { href: '/worker-dashboard/executions', label: 'Executions' },
+    { href: '/worker-dashboard/transactions', label: 'Transactions' },
     { href: '/worker-dashboard/storage', label: 'Storage' },
     { href: '/worker-dashboard/contract', label: 'Contract' },
     { href: '/worker-dashboard/logs', label: 'Live Log' },
