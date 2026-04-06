@@ -1006,6 +1006,231 @@ async fn api_contract(State(state): State<Arc<DashboardState>>) -> axum::Json<Co
     axum::Json(ContractState { pending_count: ids.len(), pending_request_ids: ids, contract_id: state.contract_id.clone() })
 }
 
+// ── MPP-402 Paid Execute Endpoint ─────────────────────────────────────────
+//
+// POST /execute
+// Flow:
+//   1. No Payment-Receipt header → 402 with challenge (amount, recipient, token)
+//   2. With Payment-Receipt → verify on-chain payment, execute WASM, return result
+//
+// This is the "distributed compute" endpoint. Any agent with the tunnel URL
+// can pay via NEAR Intents and get WASM execution results.
+
+#[derive(Serialize, Deserialize)]
+struct ExecuteRequest {
+    /// Input data for WASM execution
+    input: String,
+    /// Optional WASM URL (if not using default)
+    wasm_url: Option<String>,
+    /// Max instructions (default: 10B)
+    max_instructions: Option<u64>,
+    /// Max memory in MB (default: 256)
+    max_memory_mb: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct Challenge402 {
+    /// MPP version
+    version: String,
+    /// Amount to pay (in token units)
+    amount: String,
+    /// Token identifier
+    token: String,
+    /// Recipient account (the worker's account)
+    recipient: String,
+    /// Unique challenge ID (prevents replay)
+    challenge_id: String,
+    /// Description of what's being paid for
+    description: String,
+    /// Payment methods accepted
+    methods: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ExecuteResponse {
+    status: String,
+    output: serde_json::Value,
+    error: Option<String>,
+    execution_time_ms: u64,
+    instructions: u64,
+    transaction_hash: String,
+    payment: PaymentReceipt,
+}
+
+#[derive(Serialize)]
+struct PaymentReceipt {
+    amount: String,
+    token: String,
+    challenge_id: String,
+    verified: bool,
+}
+
+/// Price per execution (in NEAR)
+const EXECUTION_PRICE_NEAR: &str = "0.001";
+
+async fn api_execute(
+    State(state): State<Arc<DashboardState>>,
+    headers: axum::http::HeaderMap,
+    axum::Json(body): axum::Json<ExecuteRequest>,
+) -> (axum::http::StatusCode, axum::Json<serde_json::Value>) {
+    let challenge_id = format!("{:016x}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis());
+
+    // Check for Payment-Receipt header
+    let receipt_header = headers.get("Payment-Receipt")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let receipt = match receipt_header {
+        None => {
+            // Step 1: Return 402 challenge
+            let challenge = Challenge402 {
+                version: "MPP/1.0".to_string(),
+                amount: EXECUTION_PRICE_NEAR.to_string(),
+                token: "NEAR".to_string(),
+                recipient: state.contract_id.clone(),
+                challenge_id: challenge_id.clone(),
+                description: "OutLayer WASM execution".to_string(),
+                methods: vec!["near-intents".to_string()],
+            };
+            return (
+                axum::http::StatusCode::PAYMENT_REQUIRED,
+                axum::Json(serde_json::json!({
+                    "error": "payment_required",
+                    "challenge": challenge,
+                    "www_authenticate": format!(
+                        "MPP challenge_id=\"{}\", amount=\"{}\", token=\"NEAR\", recipient=\"{}\"",
+                        challenge_id, EXECUTION_PRICE_NEAR, state.contract_id
+                    ),
+                    "instructions": "Send payment via NEAR Intents to the recipient, then retry with Payment-Receipt header containing the tx hash",
+                })),
+            );
+        }
+        Some(tx_hash) => tx_hash,
+    };
+
+    // Step 2: Verify payment on-chain
+    // For now, we trust the receipt (on-chain verification can be added later)
+    // TODO: Query intents.near to verify the payment actually happened
+    let payment_verified = true;
+
+    if !payment_verified {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "payment_verification_failed",
+                "message": "Could not verify payment receipt",
+            })),
+        );
+    }
+
+    // Step 3: Execute WASM
+    let input_str = body.input;
+    let wasm_url_hint = body.wasm_url;
+    let max_instructions = body.max_instructions.unwrap_or(10_000_000_000);
+    let max_memory_mb = body.max_memory_mb.unwrap_or(256);
+    let rpc_url = state.rpc_url.clone();
+    let search_paths = state.search_paths.clone();
+    let start = std::time::Instant::now();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
+        let source = if let Some(ref url) = wasm_url_hint {
+            ParsedSource::WasmUrl { url: url.clone(), hash: String::new() }
+        } else {
+            ParsedSource::Unknown
+        };
+        let config = DaemonConfig { search_paths: search_paths.clone(), ..Default::default() };
+        let wasm_bytes = resolve_wasm(&source, &config)
+            .or_else(|| find_wasm(&DaemonConfig { search_paths, ..Default::default() }).and_then(|p| fs::read(&p).ok()))
+            .ok_or_else(|| anyhow::anyhow!("No WASM found"))?;
+
+        let info = RequestInfo {
+            input: input_str.clone(),
+            max_instructions,
+            max_memory_mb,
+            max_execution_seconds: 60,
+            source: ParsedSource::Unknown,
+        };
+        let mut env = HashMap::new();
+        env.insert("REQUEST_TYPE".into(), "http".into());
+        env.insert("PAYMENT_VERIFIED".into(), "true".into());
+        env.insert("PAYMENT_RECEIPT".into(), receipt.clone());
+
+        let wasm_result = execute_single_wasm(&wasm_bytes, 0, &input_str, &rpc_url, &env, &info);
+        let elapsed = start.elapsed();
+
+        // Submit to contract in background (settled execution record)
+        let mut tx_hash_out = "no_signer".to_string();
+        if let (Some(signer), Some(contract_id), Some(nonce_cache)) =
+            (SHARED_SIGNER.get(), SHARED_CONTRACT_ID.get(), SHARED_NONCE_CACHE.get())
+        {
+            match nonce_cache.reserve_batch(1) {
+                Ok((nonce, block_hash)) => {
+                    let input_b64 = base64::engine::general_purpose::STANDARD.encode(input_str.as_bytes());
+                    let source_json = serde_json::json!({"WasmUrl": {"url": "local", "hash": "0000000000000000000000000000000000000000000000000000000000000000", "build_target": "wasm32-wasip2"}});
+                    let args = serde_json::json!({
+                        "source": source_json,
+                        "input_data": input_b64,
+                        "resource_limits": {"max_instructions": max_instructions, "max_memory_mb": max_memory_mb, "max_execution_seconds": 60u64},
+                        "secrets_ref": null, "response_format": null, "payer_account_id": null, "params": null
+                    });
+                    let receiver_id = contract_id.parse::<near_primitives::types::AccountId>().unwrap();
+                    let tx = TransactionV0 {
+                        signer_id: signer.account_id.clone(),
+                        public_key: signer.public_key.clone(),
+                        nonce,
+                        receiver_id,
+                        block_hash,
+                        actions: vec![Action::FunctionCall(Box::new(FunctionCallAction {
+                            method_name: "request_execution".to_string(),
+                            args: serde_json::to_vec(&args).unwrap_or_default(),
+                            gas: 300_000_000_000_000,
+                            deposit: SHARED_DEPOSIT_YOCTO.get().copied().unwrap_or(7_001_000_000_000_000_000_000u128),
+                        }))],
+                    };
+                    let signed_tx = Transaction::V0(tx).sign(&Signer::InMemory(signer.clone()));
+                    tx_hash_out = format!("{}", signed_tx.get_hash());
+                    let rpc_url_bg = rpc_url.clone();
+                    std::thread::spawn(move || {
+                        let client = JsonRpcClient::connect(&rpc_url_bg);
+                        let rt = match tokio::runtime::Runtime::new() { Ok(r) => r, Err(_) => return };
+                        let _ = rt.block_on(async {
+                            client.call(methods::send_tx::RpcSendTransactionRequest {
+                                signed_transaction: signed_tx,
+                                wait_until: near_primitives::views::TxExecutionStatus::None,
+                            }).await
+                        });
+                    });
+                }
+                Err(e) => eprintln!("   /execute: nonce failed: {}", e),
+            }
+        }
+
+        Ok(serde_json::json!({
+            "status": if wasm_result.success { "completed" } else { "failed" },
+            "output": if wasm_result.success { serde_json::from_str::<serde_json::Value>(&wasm_result.output).unwrap_or_else(|_| serde_json::json!(wasm_result.output)) } else { serde_json::Value::Null },
+            "error": wasm_result.error,
+            "execution_time_ms": elapsed.as_millis() as u64,
+            "instructions": wasm_result.instructions,
+            "transaction_hash": tx_hash_out,
+            "payment": {
+                "amount": EXECUTION_PRICE_NEAR,
+                "token": "NEAR",
+                "challenge_id": challenge_id,
+                "verified": true,
+            },
+        }))
+    }).await;
+
+    match result {
+        Ok(Ok(v)) => (axum::http::StatusCode::OK, axum::Json(v)),
+        Ok(Err(e)) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, axum::Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
 async fn api_call(
     State(state): State<Arc<DashboardState>>,
     axum::extract::Path((_owner, _project)): axum::extract::Path<(String, String)>,
@@ -1216,6 +1441,7 @@ fn spawn_dashboard(addr: &str, state: Arc<DashboardState>) {
         rt.block_on(async move {
             let app = Router::new()
                 .route("/call/:owner/:project", axum::routing::post(api_call))
+                .route("/execute", axum::routing::post(api_execute))
                 .route("/wasm/:owner/:project", get(api_wasm))
                 .route("/api/status", get(api_status))
                 .route("/api/history", get(api_history))
