@@ -96,6 +96,7 @@ struct ExecutionRecord {
     instructions: u64,
     timestamp: String,
     success: bool,
+    resolve_tx_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1844,6 +1845,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                         instructions: result.instructions,
                         timestamp: now(),
                         success: result.success,
+                        resolve_tx_hash: None, // updated after resolve
                     };
                     {
                         let mut hist = dashboard_state.history.lock().unwrap();
