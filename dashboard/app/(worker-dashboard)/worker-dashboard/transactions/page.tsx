@@ -17,11 +17,11 @@ interface RpcTx {
   fee?: string;
 }
 
-const RPCS = [
-  'https://test.rpc.fastnear.com',
-  'https://near.lava.build',
-  'https://near.drpc.org',
-];
+// RPC pool — testnet or mainnet
+const RPCS_BY_NETWORK = {
+  testnet: ['https://test.rpc.fastnear.com'],
+  mainnet: ['https://near.lava.build', 'https://near.drpc.org', 'https://near.blockpi.network/v1/rpc/public'],
+};
 
 let rpcIndex = 0;
 async function rpcCall(method: string, params: unknown): Promise<unknown> {
@@ -88,12 +88,26 @@ export default function TransactionsPage() {
 
       const newTxs: RpcTx[] = [];
 
-      // Check last 5 blocks
-      for (let offset = 0; offset < 5; offset++) {
-        const h = currentHeight - offset;
-        if (h <= 0) continue;
+      // Scan last 100 blocks for txs (covers ~100s of history)
+      const SCAN_DEPTH = 100;
+      const BATCH_SIZE = 10; // Fetch 10 blocks at a time to avoid rate limits
 
-        const blk: any = await rpcCall('block', { block_id: h });
+      for (let batchStart = 0; batchStart < SCAN_DEPTH; batchStart += BATCH_SIZE) {
+        const heights = [];
+        for (let i = batchStart; i < Math.min(batchStart + BATCH_SIZE, SCAN_DEPTH); i++) {
+          const h = currentHeight - i;
+          if (h > 0) heights.push(h);
+        }
+        if (heights.length === 0) break;
+
+        // Fetch blocks in parallel per batch
+        const blockResults = await Promise.allSettled(
+          heights.map(h => rpcCall('block', { block_id: h }))
+        );
+
+        for (const blockRes of blockResults) {
+          if (blockRes.status !== 'fulfilled') continue;
+          const blk = blockRes.value as any;
         const chunkHashes = blk.chunks.map((c: any) => c.chunk_hash);
 
         // Fetch chunks in parallel
