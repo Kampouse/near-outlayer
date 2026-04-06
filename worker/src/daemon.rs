@@ -1874,6 +1874,13 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                         Ok(tx_hash) => {
                             processed.insert(req_id);
                             log(&format!("   Tx: {}", tx_hash));
+                            // Update the resolve_tx_hash in history
+                            {
+                                let mut hist = dashboard_state.history.lock().unwrap();
+                                if let Some(rec) = hist.iter_mut().find(|r| r.request_id == req_id) {
+                                    rec.resolve_tx_hash = Some(tx_hash);
+                                }
+                            }
                         },
                         Err(e) => {
                             // Don't mark as processed — will retry next poll

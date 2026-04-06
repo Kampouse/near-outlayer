@@ -20,6 +20,7 @@ export interface ExecutionRecord {
   instructions: number;
   timestamp: string;
   success: boolean;
+  resolve_tx_hash: string | null;
 }
 
 export interface StorageEntry {
