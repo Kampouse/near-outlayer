@@ -15,7 +15,6 @@ interface RpcTx {
   gas_used?: string;
   fee?: string;
   logs?: string[];
-  label?: string;
 }
 
 async function rpcCall(url: string, method: string, params: unknown): Promise<unknown> {
@@ -47,7 +46,6 @@ function fmtGas(gas: string): string {
   return (parseFloat(gas) / 1e12).toFixed(3) + ' TGas';
 }
 
-// Fetch full tx details by hash
 async function fetchTxByHash(hash: string, rpcUrl: string): Promise<RpcTx | null> {
   try {
     const txStatus: any = await rpcCall(rpcUrl, 'EXPERIMENTAL_tx_status', [hash]);
@@ -102,12 +100,8 @@ async function fetchTxByHash(hash: string, rpcUrl: string): Promise<RpcTx | null
   } catch { return null; }
 }
 
-// Known tx hashes — updated from daemon history + SSE events
-const knownHashes: string[] = [
-  // Seed with the tx we already know about
-  '9ncLqnK7e5Rw5BLp5wFb6HZvkcSr1zNe2oMhXwPU9wY5',
-  '3DJpxt1pt8w9a6m1qZVMzd2yTfhXHr9TWYSqyS9tXEDC',
-];
+// Known tx hashes — updated by SSE and history
+const knownHashes: string[] = [];
 
 export default function TransactionsPage() {
   const [txs, setTxs] = useState<RpcTx[]>([]);
@@ -129,7 +123,6 @@ export default function TransactionsPage() {
   const load = useCallback(async () => {
     if (!rpcUrl) return;
     try {
-      // Get latest block height for display
       const block: any = await rpcCall(rpcUrl, 'block', { finality: 'final' });
       setLastBlock(block.header.height);
 
@@ -141,14 +134,12 @@ export default function TransactionsPage() {
           const history = await historyRes.json() as any[];
           for (const rec of history) {
             if (rec.resolve_tx_hash) hashes.add(rec.resolve_tx_hash);
-            // Also try to find request tx hash from SSE events
           }
         }
       } catch {}
 
-      // Fetch details for each hash (parallel, skip already seen)
-      const newHashes = [...hashes].filter(h => !seenRef.current.has(h));
-      const allHashes = [...seenRef.current, ...newHashes].slice(0, 50);
+      const allHashes = [...hashes].filter(h => !seenRef.current.has(h)).concat([...seenRef.current]).slice(0, 50);
+      seenRef.current = new Set(allHashes);
 
       const results = await Promise.allSettled(
         allHashes.map(h => fetchTxByHash(h, rpcUrl))
@@ -159,7 +150,6 @@ export default function TransactionsPage() {
         .map(r => r.value)
         .sort((a, b) => b.block_height - a.block_height);
 
-      seenRef.current = new Set(allHashes);
       setTxs(validTxs);
     } catch (e: any) {
       setError(e.message);
@@ -175,17 +165,15 @@ export default function TransactionsPage() {
     return () => clearInterval(iv);
   }, [load, autoRefresh]);
 
-  // SSE listener for real-time resolve events
+  // SSE for real-time resolve events
   useEffect(() => {
     const sseUrl = `${process.env.NEXT_PUBLIC_WORKER_API_URL || 'http://127.0.0.1:8082/api'}/stream`;
     const es = new EventSource(sseUrl);
     es.onmessage = (e) => {
-      const data = e.data as string;
-      // If SSE event contains a tx hash, add it
-      const match = data.match(/Tx:\s*(\w+)/);
+      const match = (e.data as string).match(/Tx:\s*(\w+)/);
       if (match) {
         knownHashes.unshift(match[1]);
-        load(); // trigger refresh
+        load();
       }
     };
     es.onerror = () => {};
