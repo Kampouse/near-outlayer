@@ -55,7 +55,7 @@ impl Rpc {
                             let msg = err.to_string();
                             ep.fails.fetch_add(1, Ordering::Relaxed);
                             if msg.contains("rate limit") || msg.contains("exceeded") || msg.contains("Too many") {
-                                eprintln!("   ⚠️ {} rate limited, trying next", ep.url);
+                                tracing::warn!("   ⚠️ {} rate limited, trying next", ep.url);
                             }
                             last_err = msg;
                             continue;

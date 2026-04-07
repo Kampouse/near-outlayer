@@ -150,8 +150,10 @@ fn init_compiled_cache(secret_key_bytes: [u8; 32]) {
     let home = dirs::home_dir().unwrap_or_default();
     let cache_dir = home.join(".inlayer").join("compiled_cache");
     match CompiledCache::new(cache_dir, 500, &secret_key_bytes) {
-        Ok(cache) => { COMPILED_CACHE.set(Arc::new(std::sync::Mutex::new(cache))).ok(); }
-        Err(e) => eprintln!("Compiled cache init failed: {}", e),
+        Ok(cache) => {
+            COMPILED_CACHE.set(Arc::new(std::sync::Mutex::new(cache))).ok();
+        }
+        Err(e) => tracing::error!("Compiled cache init failed: {}", e),
     }
 }
 
@@ -244,7 +246,7 @@ fn resolve_wasm_from_url(url: &str, _hash: &str) -> Option<Vec<u8>> {
         for dir in &search_dirs {
             let candidate = dir.join(filename);
             if candidate.exists() {
-                eprintln!("   📦 Local WASM: {}", candidate.display());
+                tracing::info!("   📦 Local WASM: {}", candidate.display());
                 return fs::read(&candidate).ok();
             }
             // Also check for wasip2 variant
@@ -252,7 +254,7 @@ fn resolve_wasm_from_url(url: &str, _hash: &str) -> Option<Vec<u8>> {
                 let p2_name = filename.replace(".wasm", "-wasip2.wasm");
                 let candidate2 = dir.join(&p2_name);
                 if candidate2.exists() {
-                    eprintln!("   📦 Local WASM: {}", candidate2.display());
+                    tracing::info!("   📦 Local WASM: {}", candidate2.display());
                     return fs::read(&candidate2).ok();
                 }
             }
@@ -264,7 +266,7 @@ fn resolve_wasm_from_url(url: &str, _hash: &str) -> Option<Vec<u8>> {
             for path in entries {
                 let fname = path.file_name().unwrap_or_default().to_string_lossy();
                 if fname == filename || (filename.contains("wasip2") && fname.contains("wasip2") && fname.contains(&filename.replace("-wasip2.wasm", "").replace(".wasm", ""))) {
-                    eprintln!("   📦 Local WASM: {}", path.display());
+                    tracing::info!("   📦 Local WASM: {}", path.display());
                     return fs::read(&path).ok();
                 }
             }
@@ -272,7 +274,7 @@ fn resolve_wasm_from_url(url: &str, _hash: &str) -> Option<Vec<u8>> {
     }
 
     // Fallback: download (only if no local match)
-    eprintln!("   ⬇️ Not found locally, downloading: {}", url);
+    tracing::info!("   ⬇️ Not found locally, downloading: {}", url);
     let cache_dir = dirs::home_dir().unwrap_or_default().join(".inlayer").join("wasm_cache");
     fs::create_dir_all(&cache_dir).ok();
     let cache_key = {
@@ -344,7 +346,7 @@ fn resolve_wasm_from_project(project_id: &str, config: &DaemonConfig) -> Option<
                             if wasm_path.is_file() && wasm_path.extension().map(|e| e == "wasm").unwrap_or(false) {
                                 let fname = wasm_path.file_name().unwrap_or_default().to_string_lossy();
                                 if !fname.starts_with('.') && !fname.contains("-deps") {
-                                    eprintln!("   📦 Project WASM: {}", wasm_path.display());
+                                    tracing::info!("   📦 Project WASM: {}", wasm_path.display());
                                     return fs::read(&wasm_path).ok();
                                 }
                             }
@@ -359,7 +361,7 @@ fn resolve_wasm_from_project(project_id: &str, config: &DaemonConfig) -> Option<
                         if p.is_file() && p.extension().map(|e| e == "wasm").unwrap_or(false) {
                             let fname = p.file_name().unwrap_or_default().to_string_lossy();
                             if fname.contains("wasip2") || fname.contains("p2") {
-                                eprintln!("   📦 Project WASM: {}", p.display());
+                                tracing::info!("   📦 Project WASM: {}", p.display());
                                 return fs::read(&p).ok();
                             }
                         }
@@ -369,7 +371,7 @@ fn resolve_wasm_from_project(project_id: &str, config: &DaemonConfig) -> Option<
         }
     }
 
-    eprintln!("   ⚠️ No WASM found for project: {}", project_id);
+    tracing::warn!("   ⚠️ No WASM found for project: {}", project_id);
     None
 }
 
@@ -430,14 +432,14 @@ pub(crate) fn find_wasm(config: &DaemonConfig) -> Option<PathBuf> {
     }
 
     if let Some((path, size)) = best {
-        eprintln!("Found WASM: {} ({} bytes)", path.display(), size);
+        tracing::info!("Found WASM: {} ({} bytes)", path.display(), size);
         if size > 1_000_000 {
-            eprintln!("WASM binary is >1MB. Consider running wasm-opt -Oz.");
+            tracing::warn!("WASM binary is >1MB. Consider running wasm-opt -Oz.");
         }
         let _ = WASM_PATH_CACHE.set(path.clone());
         Some(path)
     } else {
-        eprintln!("No WASM found in search_paths: {:?}", config.search_paths);
+        tracing::warn!("No WASM found in search_paths: {:?}", config.search_paths);
         None
     }
 }
@@ -563,7 +565,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
 
     // ── Cloudflare Tunnel Setup ───────────────────────────────────────────
     if use_tunnel {
-        eprintln!("🌐 Cloudflare tunnel requested...");
+        tracing::info!("🌐 Cloudflare tunnel requested...");
         let tunnel_url = tunnel::spawn_cloudflare_tunnel(8082)?;
 
         // Save tunnel URL to config
@@ -573,7 +575,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
             if !config_str.contains("tunnel_url") {
                 config_str.push_str(&format!("\ntunnel_url = \"{}\"\n", tunnel_url));
                 fs::write(&config_path, config_str)?;
-                eprintln!("💾 Saved tunnel URL to config");
+                tracing::info!("💾 Saved tunnel URL to config");
             }
         }
 
@@ -584,23 +586,28 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
         let pid_path = daemon_cfg.pid_file_path();
         let log_path = daemon_cfg.log_file_path();
         if manage::is_running(&pid_path) {
-            eprintln!("inlayer daemon already running (PID {})", manage::read_pid(&pid_path).unwrap_or_default());
+            tracing::error!(
+                "inlayer daemon already running (PID {})",
+                manage::read_pid(&pid_path).unwrap_or_default()
+            );
             std::process::exit(1);
         }
-        eprintln!("Starting inlayer daemon...");
-        eprintln!("   Log: {}", log_path.display());
-        eprintln!("   PID: {}", pid_path.display());
+        tracing::info!("Starting inlayer daemon...");
+        tracing::info!("   Log: {}", log_path.display());
+        tracing::info!("   PID: {}", pid_path.display());
         manage::daemonize(&log_path, &pid_path)?;
     } else {
         let pid_path = daemon_cfg.pid_file_path();
-        if let Some(parent) = pid_path.parent() { fs::create_dir_all(parent).ok(); }
+        if let Some(parent) = pid_path.parent() {
+            fs::create_dir_all(parent).ok();
+        }
         fs::write(&pid_path, std::process::id().to_string()).ok();
-        eprintln!("⚡ inlayer daemon — OutLayer local worker (direct RPC)");
-        eprintln!("   Contract:   {}", daemon_cfg.contract_id);
-        eprintln!("   Account:    {}", daemon_cfg.account_id);
-        eprintln!("   RPC:        {}", daemon_cfg.rpc_url());
-        eprintln!("   Poll:       {}s", daemon_cfg.poll_interval_secs);
-        eprintln!("   WASM paths: {:?}", daemon_cfg.search_paths);
+        tracing::info!("⚡ inlayer daemon — OutLayer local worker (direct RPC)");
+        tracing::info!("   Contract:   {}", daemon_cfg.contract_id);
+        tracing::info!("   Account:    {}", daemon_cfg.account_id);
+        tracing::info!("   RPC:        {}", daemon_cfg.rpc_url());
+        tracing::info!("   Poll:       {}s", daemon_cfg.poll_interval_secs);
+        tracing::info!("   WASM paths: {:?}", daemon_cfg.search_paths);
     }
 
     // ── Dashboard setup ────────────────────────────────────────────────
@@ -666,7 +673,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
         daemon_cfg.contract_id, daemon_cfg.account_id, rpc_url));
 
     let rpc_urls = daemon_cfg.rpc_urls();
-    eprintln!("   RPC pool:   {} endpoints", rpc_urls.len());
+    tracing::info!("   RPC pool:   {} endpoints", rpc_urls.len());
     let rpc = rpc_pool::Rpc::from_urls(rpc_urls);
     let mut processed: HashSet<u64> = HashSet::new();
     let nonce_cache = Arc::new(nonce::NonceCache::new(rpc_url.clone(), signer.clone()));
@@ -679,7 +686,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     // Clean up PID file on Ctrl+C / SIGTERM
     let pid_path_cleanup = pid_path.clone();
     ctrlc::set_handler(move || {
-        eprintln!("Received Ctrl+C, shutting down...");
+        tracing::info!("Received Ctrl+C, shutting down...");
         let _ = std::fs::remove_file(&pid_path_cleanup);
         std::process::exit(0);
     }).ok();
@@ -832,7 +839,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                                     "request_id": req_id,
                                     "tx_hash": hash,
                                     "success": wr.1
-                                })).unwrap()
+                                })).unwrap_or_default()
                             );
                             log(&format!("   Tx: {}", hash));
 

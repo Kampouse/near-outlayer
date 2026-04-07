@@ -293,7 +293,13 @@ pub(crate) async fn api_execute(
                         "resource_limits": {"max_instructions": max_instructions, "max_memory_mb": max_memory_mb, "max_execution_seconds": 60u64},
                         "secrets_ref": null, "response_format": null, "payer_account_id": null, "params": null
                     });
-                    let receiver_id = contract_id.parse::<near_primitives::types::AccountId>().unwrap();
+                    let receiver_id = match contract_id.parse::<near_primitives::types::AccountId>() {
+                        Ok(id) => id,
+                        Err(e) => {
+                            tracing::error!("   /execute: contract_id parse error: {}", e);
+                            return Ok(serde_json::json!({"status": "error", "error": format!("contract_id parse: {}", e)}));
+                        }
+                    };
                     let tx = TransactionV0 {
                         signer_id: signer.account_id.clone(),
                         public_key: signer.public_key.clone(),
@@ -321,7 +327,7 @@ pub(crate) async fn api_execute(
                         });
                     });
                 }
-                Err(e) => eprintln!("   /execute: nonce failed: {}", e),
+                Err(e) => tracing::error!("   /execute: nonce failed: {}", e),
             }
         }
 
@@ -413,7 +419,10 @@ pub(crate) async fn api_call(
                     });
                     let receiver_id = match contract_id.parse::<near_primitives::types::AccountId>() {
                         Ok(id) => id,
-                        Err(e) => { eprintln!("   /call: contract_id parse error: {}", e); return Ok(serde_json::json!({"status": "error", "error": format!("contract_id parse: {}", e)})); }
+                        Err(e) => {
+                            tracing::error!("   /call: contract_id parse error: {}", e);
+                            return Ok(serde_json::json!({"status": "error", "error": format!("contract_id parse: {}", e)}));
+                        }
                     };
                     // Build + sign tx RIGHT NOW (before spawning) with pre-warmed nonce
                     let tx = TransactionV0 {
@@ -445,10 +454,10 @@ pub(crate) async fn api_call(
                                 wait_until: near_primitives::views::TxExecutionStatus::None,
                             }).await
                         });
-                        eprintln!("   /call bg: tx sent (nonce={})", nonce);
+                        tracing::debug!("   /call bg: tx sent (nonce={})", nonce);
                     });
                 }
-                Err(e) => eprintln!("   /call: nonce pre-warm failed: {}", e),
+                Err(e) => tracing::error!("   /call: nonce pre-warm failed: {}", e),
             }
         }
 
@@ -549,13 +558,19 @@ pub(crate) fn spawn_dashboard(addr: &str, state: Arc<DashboardState>) {
     let addr_str = addr.to_string();
     let addr: SocketAddr = match addr.parse() {
         Ok(a) => a,
-        Err(e) => { eprintln!("Invalid dashboard address '{}': {}", addr, e); return; }
+        Err(e) => {
+            tracing::error!("Invalid dashboard address '{}': {}", addr, e);
+            return;
+        }
     };
     let state_clone = state.clone();
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
-            Err(e) => { eprintln!("Dashboard runtime failed: {}", e); return; }
+            Err(e) => {
+                tracing::error!("Dashboard runtime failed: {}", e);
+                return;
+            }
         };
         rt.block_on(async move {
             let app = Router::new()
@@ -569,13 +584,16 @@ pub(crate) fn spawn_dashboard(addr: &str, state: Arc<DashboardState>) {
                 .route("/api/contract", get(api_contract))
                 .layer(CorsLayer::permissive())
                 .with_state(state_clone);
-            eprintln!("Dashboard: http://{}", addr_str);
+            tracing::info!("Dashboard: http://{}", addr_str);
             let listener = match tokio::net::TcpListener::bind(addr).await {
                 Ok(l) => l,
-                Err(e) => { eprintln!("Dashboard bind failed: {}", e); return; }
+                Err(e) => {
+                    tracing::error!("Dashboard bind failed: {}", e);
+                    return;
+                }
             };
             if let Err(e) = axum::serve(listener, app).await {
-                eprintln!("Dashboard server error: {}", e);
+                tracing::error!("Dashboard server error: {}", e);
             }
         });
     });

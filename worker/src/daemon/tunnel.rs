@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 /// Spawn a Cloudflare tunnel on the given port.
 /// Returns the public tunnel URL.
 pub(crate) fn spawn_cloudflare_tunnel(port: u16) -> Result<String> {
-    eprintln!("🌐 Starting Cloudflare tunnel...");
+    tracing::info!("🌐 Starting Cloudflare tunnel...");
 
     let log_path = dirs::home_dir()
         .unwrap_or_default()
@@ -40,21 +40,20 @@ pub(crate) fn spawn_cloudflare_tunnel(port: u16) -> Result<String> {
         .join("cloudflared.pid");
     fs::write(&pid_path, pid.to_string()).ok();
 
-    eprintln!("   Waiting for tunnel URL...");
+    tracing::info!("   Waiting for tunnel URL...");
 
     // Wait for tunnel URL to appear in logs (up to 20 seconds)
     for _ in 1..=20 {
         std::thread::sleep(Duration::from_secs(1));
-        eprint!(".");
+        tracing::debug!(".");
 
         if let Ok(log_content) = fs::read_to_string(&log_path) {
             // Extract URL using regex
             if let Ok(re) = regex::Regex::new(r"https://[a-z0-9-]+\.trycloudflare\.com") {
                 if let Some(m) = re.find(&log_content) {
                     let url = m.as_str().to_string();
-                    eprintln!();
-                    eprintln!("   ✅ Tunnel created!");
-                    eprintln!("   📍 URL: {}", url);
+                    tracing::info!("   ✅ Tunnel created!");
+                    tracing::info!("   📍 URL: {}", url);
                     return Ok(url);
                 }
             }
@@ -73,8 +72,11 @@ pub(crate) fn stop_cloudflare_tunnel() {
 
     if let Ok(pid_str) = fs::read_to_string(&pid_path) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            eprintln!("🛑 Stopping Cloudflare tunnel...");
-            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+            tracing::info!("🛑 Stopping Cloudflare tunnel...");
+            // Safe: use kill command instead of unsafe libc::kill
+            let _ = std::process::Command::new("kill")
+                .args([&pid.to_string()])
+                .status();
             let _ = std::thread::sleep(Duration::from_millis(500));
             let _ = fs::remove_file(&pid_path);
         }

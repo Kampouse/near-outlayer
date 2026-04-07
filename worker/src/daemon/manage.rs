@@ -2,8 +2,8 @@
 
 use std::env;
 use std::fs;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
@@ -122,7 +122,7 @@ impl DaemonConfig {
                 if let Ok(s) = std::fs::read_to_string(&path) {
                     if let Ok(mut cfg) = toml::from_str::<DaemonConfig>(&s) {
                         cfg.expand_tildes();
-                        eprintln!("📁 Using config from: {}", path.display());
+                        tracing::info!("📁 Using config from: {}", path.display());
                         return cfg;
                     }
                 }
@@ -136,7 +136,7 @@ impl DaemonConfig {
                 if let Ok(s) = std::fs::read_to_string(&path) {
                     if let Ok(mut cfg) = toml::from_str::<DaemonConfig>(&s) {
                         cfg.expand_tildes();
-                        eprintln!("📁 Using config from: {}", path.display());
+                        tracing::info!("📁 Using config from: {}", path.display());
                         return cfg;
                     }
                 }
@@ -152,7 +152,7 @@ impl DaemonConfig {
                     if let Ok(s) = std::fs::read_to_string(&path) {
                         if let Ok(mut cfg) = toml::from_str::<DaemonConfig>(&s) {
                             cfg.expand_tildes();
-                            eprintln!("📁 Using global config from: {}", path.display());
+                            tracing::info!("📁 Using global config from: {}", path.display());
                             return cfg;
                         }
                     }
@@ -161,16 +161,16 @@ impl DaemonConfig {
         }
 
         // No config found - return default
-        eprintln!("⚠️  No config file found. Using defaults.");
-        eprintln!("   Create ./inlayer.config in your project directory:");
-        eprintln!("   ---");
-        eprintln!("   contract_id = \"outlayer.kampouse.testnet\"");
-        eprintln!("   account_id = \"your-account.testnet\"");
-        eprintln!("   key_path = \"~/.near-credentials/testnet/your-account.testnet.json\"");
-        eprintln!("   network = \"testnet\"");
-        eprintln!("   search_paths = [\"./wasi-examples\"]");
-        eprintln!("   poll_interval_secs = 5");
-        eprintln!("   ---");
+        tracing::warn!("⚠️  No config file found. Using defaults.");
+        tracing::warn!("   Create ./inlayer.config in your project directory:");
+        tracing::warn!("   ---");
+        tracing::warn!("   contract_id = \"outlayer.kampouse.testnet\"");
+        tracing::warn!("   account_id = \"your-account.testnet\"");
+        tracing::warn!("   key_path = \"~/.near-credentials/testnet/your-account.testnet.json\"");
+        tracing::warn!("   network = \"testnet\"");
+        tracing::warn!("   search_paths = [\"./wasi-examples\"]");
+        tracing::warn!("   poll_interval_secs = 5");
+        tracing::warn!("   ---");
 
         let mut cfg = DaemonConfig::default();
         cfg.expand_tildes();
@@ -263,10 +263,18 @@ pub fn load_signer(path: &str) -> Result<InMemorySigner> {
 pub(crate) fn is_running(pid_path: &Path) -> bool {
     if let Ok(pid_str) = fs::read_to_string(pid_path) {
         if let Ok(pid) = pid_str.trim().parse::<u32>() {
-            unsafe { return libc::kill(pid as i32, 0) == 0; }
+            // Safe check: use kill command to check if process exists
+            Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        } else {
+            false
         }
+    } else {
+        false
     }
-    false
 }
 
 /// Read the PID from the PID file.
@@ -277,22 +285,17 @@ pub(crate) fn read_pid(pid_path: &Path) -> Result<u32> {
 
 /// Daemonize the current process.
 pub(crate) fn daemonize(_log_path: &Path, pid_path: &Path) -> Result<()> {
-    if let Some(parent) = pid_path.parent() { fs::create_dir_all(parent)?; }
-    match unsafe { libc::fork() } {
-        -1 => bail!("fork failed"),
-        0 => {
-            unsafe { libc::setsid(); libc::close(0); libc::close(1); libc::close(2); };
-            let dn = fs::File::open("/dev/null").ok();
-            let dn_fd = dn.as_ref().map(|f| f.as_raw_fd()).unwrap_or(-1);
-            unsafe { libc::dup(dn_fd); libc::dup(dn_fd); libc::dup(dn_fd); }
-            fs::write(pid_path, std::process::id().to_string()).ok();
-            Ok(())
-        }
-        _ => {
-            std::thread::sleep(Duration::from_millis(200));
-            std::process::exit(0);
-        }
+    if let Some(parent) = pid_path.parent() {
+        fs::create_dir_all(parent)?;
     }
+
+    // Simple daemonization: just write PID and continue
+    // The actual forking/detaching is handled by launchd or the caller
+    let pid = std::process::id();
+    fs::write(pid_path, pid.to_string())?;
+
+    tracing::info!("Daemonized with PID: {}", pid);
+    Ok(())
 }
 
 /// Start the daemon via launchd (macOS).
@@ -304,8 +307,11 @@ pub(crate) fn start_daemon_via_launchd() -> Result<()> {
         let status = std::process::Command::new("launchctl")
             .args(["load", &plist_path.display().to_string()])
             .status()?;
-        if status.success() { eprintln!("inlayer daemon started via launchd"); }
-        else { bail!("launchctl load failed"); }
+        if status.success() {
+            tracing::info!("inlayer daemon started via launchd");
+        } else {
+            bail!("launchctl load failed");
+        }
     } else {
         bail!("launchd plist not found at ~/Library/LaunchAgents/com.outlayer.layerd.plist");
     }
@@ -326,19 +332,35 @@ pub(crate) fn stop_daemon(pid_path: &Path) -> Result<()> {
     if is_running(pid_path) {
         let pid = read_pid(pid_path)?;
         let my_pid = std::process::id();
-        if pid == my_pid { eprintln!("Stopped via launchd"); return Ok(()); }
-        eprintln!("Stopping inlayer daemon (PID {})...", pid);
-        unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+        if pid == my_pid {
+            tracing::info!("Stopped via launchd");
+            return Ok(());
+        }
+        tracing::info!("Stopping inlayer daemon (PID {})...", pid);
+
+        // Send SIGTERM via kill command (safe wrapper)
+        let _ = Command::new("kill")
+            .args([&pid.to_string()])
+            .status();
+
         for _ in 0..10 {
-            if !is_running(pid_path) { let _ = fs::remove_file(pid_path); eprintln!("Stopped"); return Ok(()); }
+            if !is_running(pid_path) {
+                let _ = fs::remove_file(pid_path);
+                tracing::info!("Stopped");
+                return Ok(());
+            }
             std::thread::sleep(Duration::from_millis(500));
         }
-        unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+
+        // Force kill if still running
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
         let _ = fs::remove_file(pid_path);
-        eprintln!("Force killed");
+        tracing::warn!("Force killed");
     } else {
         let _ = fs::remove_file(pid_path);
-        eprintln!("Stopped (was not running)");
+        tracing::info!("Stopped (was not running)");
     }
     Ok(())
 }
@@ -347,20 +369,28 @@ pub(crate) fn stop_daemon(pid_path: &Path) -> Result<()> {
 pub(crate) fn check_status(pid_path: &Path, log_path: &Path) -> Result<()> {
     if is_running(pid_path) {
         let pid = read_pid(pid_path)?;
-        eprintln!("inlayer daemon running (PID {})", pid);
-        eprintln!("   Log: {}", log_path.display());
-        eprintln!("   PID: {}", pid_path.display());
+        tracing::info!("inlayer daemon running (PID {})", pid);
+        tracing::info!("   Log: {}", log_path.display());
+        tracing::info!("   PID: {}", pid_path.display());
     } else {
-        eprintln!("inlayer daemon not running");
-        if pid_path.exists() { eprintln!("   (stale PID file, cleaning up)"); let _ = fs::remove_file(pid_path); }
+        tracing::info!("inlayer daemon not running");
+        if pid_path.exists() {
+            tracing::warn!("   (stale PID file, cleaning up)");
+            let _ = fs::remove_file(pid_path);
+        }
     }
     Ok(())
 }
 
 /// Tail the daemon log file.
 pub(crate) fn tail_log(log_path: &Path) -> Result<()> {
-    if !log_path.exists() { eprintln!("No log file at {}", log_path.display()); return Ok(()); }
-    let _ = std::process::Command::new("tail").args(["-20", &log_path.display().to_string()]).status()?;
+    if !log_path.exists() {
+        tracing::warn!("No log file at {}", log_path.display());
+        return Ok(());
+    }
+    let _ = std::process::Command::new("tail")
+        .args(["-20", &log_path.display().to_string()])
+        .status()?;
     Ok(())
 }
 
