@@ -1,16 +1,19 @@
 use offchainvm_worker::api_client::ExecutionOutput;
 use offchainvm_worker::api_client::{ResourceLimits, ResponseFormat};
 use offchainvm_worker::config::RpcProxyConfig;
+use offchainvm_worker::config_client::{ClientConfig, ExecuteRequest, ExecuteResponse, PaymentChallenge, PaymentReceipt, PaymentRequiredResponse};
 use offchainvm_worker::executor::{ExecutionContext, Executor};
 use offchainvm_worker::outlayer_rpc::RpcProxy;
 use offchainvm_worker::outlayer_storage::client::StorageConfig;
 
 use std::collections::HashMap;
 use std::env;
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as AnyhowContext, Result};
+use base64::Engine;
 use near_crypto::{InMemorySigner, Signer};
 use near_jsonrpc_client::{JsonRpcClient, methods};
 use near_jsonrpc_primitives::types::query::QueryResponseKind;
@@ -972,7 +975,7 @@ fn find_project_wasm(search_paths: &[String], project_name: &str) -> Option<Path
                     if dirname.contains(project_name) {
                         let release = path.join("target").join("wasm32-wasip2").join("release");
                         if let Ok(wasm_entries) = release.read_dir() {
-                            for wasm_entry in wasm_entries.flatten() {
+                            for wasm_entry in wasm_entries.flat_map(|e| e.ok()) {
                                 let wasm_path = wasm_entry.path();
                                 if wasm_path.is_file() && wasm_path.extension().map(|e| e == "wasm").unwrap_or(false) {
                                     let fname = wasm_path.file_name()?.to_string_lossy();
@@ -996,6 +999,465 @@ fn find_project_wasm(search_paths: &[String], project_name: &str) -> Option<Path
         }
     }
     None
+}
+
+// ============================================================================
+// Client Commands - Execute on remote workers
+// ============================================================================
+
+/// Execute a command on a remote worker
+fn cmd_exec(extra_args: &[String]) -> Result<()> {
+    let cfg = ClientConfig::load();
+    
+    let mut worker_url: Option<String> = None;
+    let mut input: Option<String> = None;
+    let mut program: Option<String> = None;
+    let mut wasm_url: Option<String> = None;
+    let mut account_id: Option<String> = None;
+    let mut no_pay = false;
+    let mut max_instructions: Option<u64> = None;
+    let mut max_memory_mb: Option<u32> = None;
+
+    let mut i = 0;
+    while i < extra_args.len() {
+        match extra_args[i].as_str() {
+            "--worker" if i + 1 < extra_args.len() => {
+                worker_url = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            "--input" if i + 1 < extra_args.len() => {
+                input = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            "--program" if i + 1 < extra_args.len() => {
+                program = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            "--wasm-url" if i + 1 < extra_args.len() => {
+                wasm_url = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            "--account" if i + 1 < extra_args.len() => {
+                account_id = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            "--max-instructions" if i + 1 < extra_args.len() => {
+                max_instructions = Some(extra_args[i + 1].parse()?);
+                i += 2;
+            }
+            "--max-memory" if i + 1 < extra_args.len() => {
+                max_memory_mb = Some(extra_args[i + 1].parse()?);
+                i += 2;
+            }
+            "--no-pay" => {
+                no_pay = true;
+                i += 1;
+            }
+            other if !other.starts_with("--") => {
+                // Positional argument - treat as input if not set
+                if input.is_none() {
+                    input = Some(other.to_string());
+                }
+                i += 1;
+            }
+            _ => {
+                eprintln!("Unknown flag: {}", extra_args[i]);
+                eprintln!("Usage: inlayer exec --worker <url> --input <data> [--program <name>] [--no-pay]");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Get worker URL
+    let worker_url = cfg.get_worker_url(worker_url.as_deref())?;
+
+    // Get input from stdin if not provided
+    let input = match input {
+        Some(i) => i,
+        None => {
+            if !io::stdin().is_terminal() {
+                let mut buf = String::new();
+                io::stdin().read_to_string(&mut buf)?;
+                buf.trim().to_string()
+            } else {
+                anyhow::bail!("No input provided. Use --input <data> or pipe data via stdin.");
+            }
+        }
+    };
+
+    // Build request
+    let req = ExecuteRequest {
+        input,
+        wasm_url,
+        program,
+        max_instructions,
+        max_memory_mb,
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()?;
+
+    let url = format!("{}/execute", worker_url.trim_end_matches('/'));
+    
+    eprintln!("🚀 Executing on {}", worker_url);
+    eprintln!("   Input: {} bytes", req.input.len());
+
+    // First request - may get 402 payment challenge
+    let resp = client
+        .post(&url)
+        .json(&req)
+        .send()
+        .context("Failed to connect to worker")?;
+
+    match resp.status() {
+        reqwest::StatusCode::OK => {
+            // Success - print result
+            let result: ExecuteResponse = resp.json().context("Failed to parse response")?;
+            print_execute_result(&result);
+            if !result.success {
+                std::process::exit(1);
+            }
+        }
+        reqwest::StatusCode::PAYMENT_REQUIRED => {
+            // Payment required
+            let resp_wrapper: PaymentRequiredResponse = resp.json().context("Failed to parse payment challenge")?;
+            let challenge = resp_wrapper.challenge;
+            handle_payment_challenge(&client, &worker_url, &req, challenge, &cfg, account_id.as_deref(), no_pay)?;
+        }
+        reqwest::StatusCode::FORBIDDEN => {
+            let error_text = resp.text().unwrap_or_else(|_| "Unknown error".to_string());
+            eprintln!("❌ Access denied: {}", error_text);
+            std::process::exit(1);
+        }
+        status => {
+            let error_text = resp.text().unwrap_or_else(|_| "Unknown error".to_string());
+            eprintln!("❌ Error {}: {}", status, error_text);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// Handle 402 payment challenge
+fn handle_payment_challenge(
+    client: &reqwest::blocking::Client,
+    worker_url: &str,
+    req: &ExecuteRequest,
+    challenge: PaymentChallenge,
+    cfg: &ClientConfig,
+    account_id: Option<&str>,
+    no_pay: bool,
+) -> Result<()> {
+    let token = challenge.token.as_deref().unwrap_or("NEAR");
+    eprintln!();
+    eprintln!("💳 Payment required:");
+    eprintln!("   Amount: {} {}", challenge.amount, token);
+    eprintln!("   To: {}", challenge.recipient);
+    eprintln!("   Challenge ID: {}", challenge.challenge_id);
+    
+    if let Some(ref methods) = challenge.methods {
+        eprintln!("   Methods: {}", methods.join(", "));
+    }
+    eprintln!();
+
+    if no_pay {
+        eprintln!("ℹ️  --no-pay flag set. Exiting without payment.");
+        eprintln!("   To pay manually, send the amount and retry with payment receipt.");
+        std::process::exit(0);
+    }
+
+    // Try to get account ID
+    let account = match cfg.get_account_id(account_id) {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("⚠️  No account ID configured. Cannot auto-pay.");
+            eprintln!("   Set account_id in ~/.inlayer/config.toml or use --account");
+            eprintln!("   Or use --no-pay to handle payment separately.");
+            std::process::exit(1);
+        }
+    };
+
+    // Check if near CLI is available
+    let near_available = std::process::Command::new("near")
+        .arg("--version")
+        .output()
+        .is_ok();
+
+    if !near_available {
+        eprintln!("⚠️  'near' CLI not found. Cannot auto-pay.");
+        eprintln!("   Install: npm install -g near-cli");
+        eprintln!("   Or pay manually and retry with payment receipt.");
+        std::process::exit(1);
+    }
+
+    // Check payment limits
+    let amount_near: f64 = challenge.amount.parse().unwrap_or(0.0);
+    let max_per_request: f64 = cfg.payment.max_per_request.parse().unwrap_or(0.01);
+    
+    if amount_near > max_per_request {
+        eprintln!("⚠️  Payment amount ({}) exceeds max_per_request ({})", 
+            challenge.amount, cfg.payment.max_per_request);
+        eprintln!("   Increase max_per_request in ~/.inlayer/config.toml to allow this payment.");
+        std::process::exit(1);
+    }
+
+    eprintln!("🔄 Auto-paying with near CLI...");
+    
+    // Determine network from account ID
+    let network = if account.ends_with(".testnet") || account.contains(".testnet.") {
+        "testnet"
+    } else if account.ends_with(".near") || account.contains(".near.") {
+        "mainnet"
+    } else {
+        "testnet"
+    };
+
+    // Execute payment
+    let tx_hash = if let Some(ref token_contract) = challenge.token {
+        if token_contract == "NEAR" || token_contract.is_empty() {
+            // Native NEAR transfer
+            pay_near(&account, &challenge.recipient, &challenge.amount, network)?
+        } else {
+            // FT transfer
+            pay_ft(&account, &challenge.recipient, &challenge.amount, token_contract, network)?
+        }
+    } else {
+        // Default to NEAR
+        pay_near(&account, &challenge.recipient, &challenge.amount, network)?
+    };
+
+    eprintln!("✅ Payment sent! tx: {}", tx_hash);
+    eprintln!("🔄 Retrying execution with payment receipt...");
+
+    // Wait a moment for transaction to be processed
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Retry with payment receipt
+    let receipt = PaymentReceipt {
+        tx_hash: tx_hash.clone(),
+        signer_account: account.clone(),
+        challenge_id: challenge.challenge_id.clone(),
+    };
+
+    let url = format!("{}/execute", worker_url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(&req)
+        .header("Payment-Receipt", base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&receipt)?))
+        .header("Signer-Account", &account)
+        .send()
+        .context("Failed to connect to worker")?;
+
+    match resp.status() {
+        reqwest::StatusCode::OK => {
+            let result: ExecuteResponse = resp.json().context("Failed to parse response")?;
+            print_execute_result(&result);
+            if !result.success {
+                std::process::exit(1);
+            }
+        }
+        status => {
+            let error_text = resp.text().unwrap_or_else(|_| "Unknown error".to_string());
+            eprintln!("❌ Error after payment {}: {}", status, error_text);
+            eprintln!("   Payment was already sent (tx: {}). Contact worker operator.", tx_hash);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// Pay native NEAR
+fn pay_near(from: &str, to: &str, amount: &str, network: &str) -> Result<String> {
+    let output = std::process::Command::new("near")
+        .args(["send", from, to, amount, "--networkId", network])
+        .output()
+        .context("Failed to run near CLI")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("near send failed: {}", stderr);
+    }
+
+    // Parse tx hash from output
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_tx_hash(&stdout)
+}
+
+/// Pay FT token
+fn pay_ft(from: &str, to: &str, amount: &str, token_contract: &str, network: &str) -> Result<String> {
+    // Convert NEAR amount to yocto (assuming 24 decimals)
+    let amount_near: f64 = amount.parse().context("Invalid amount")?;
+    let amount_yocto = (amount_near * 1e24) as u128;
+
+    let msg = format!(
+        r#"{{"receiver_id":"{}","amount":"{}","msg":""}}"#,
+        to, amount_yocto
+    );
+
+    let output = std::process::Command::new("near")
+        .args([
+            "call", token_contract, "ft_transfer_call",
+            &msg,
+            "--accountId", from,
+            "--depositYocto", "1",
+            "--gas", "100000000000000",
+            "--networkId", network,
+        ])
+        .output()
+        .context("Failed to run near CLI")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("near call ft_transfer_call failed: {}", stderr);
+    }
+
+    // Parse tx hash from output
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_tx_hash(&stdout)
+}
+
+/// Parse transaction hash from near CLI output
+fn parse_tx_hash(output: &str) -> Result<String> {
+    // Look for "Transaction Id: <hash>" or similar patterns
+    for line in output.lines() {
+        if line.contains("Transaction Id:") || line.contains("tx hash:") {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            for (i, part) in parts.iter().enumerate() {
+                if *part == "Id:" || *part == "hash:" {
+                    if let Some(hash) = parts.get(i + 1) {
+                        return Ok(hash.trim_end_matches(',').to_string());
+                    }
+                }
+            }
+        }
+        // Also try to match a hash directly
+        for part in line.split_whitespace() {
+            if part.len() == 44 && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return Ok(part.to_string());
+            }
+        }
+    }
+    anyhow::bail!("Could not parse transaction hash from output: {}", output)
+}
+
+/// Print execution result
+fn print_execute_result(result: &ExecuteResponse) {
+    println!("{}", "=".repeat(60));
+    println!("✅ Success: {}", result.success);
+    if let Some(time) = result.execution_time_ms {
+        println!("⏱️  Time: {}ms", time);
+    }
+    if let Some(instr) = result.instructions {
+        println!("📊 Instructions: {}", instr);
+    }
+    if let Some(ref output) = result.output {
+        println!("📤 Output:");
+        match output {
+            serde_json::Value::String(s) => println!("{}", s),
+            _ => println!("{}", serde_json::to_string_pretty(output).unwrap_or_default()),
+        }
+    }
+    if let Some(ref error) = result.error {
+        println!("❌ Error: {}", error);
+    }
+}
+
+/// Check worker status
+fn cmd_ping(extra_args: &[String]) -> Result<()> {
+    let cfg = ClientConfig::load();
+    
+    let mut worker_url: Option<String> = None;
+
+    let mut i = 0;
+    while i < extra_args.len() {
+        match extra_args[i].as_str() {
+            "--worker" if i + 1 < extra_args.len() => {
+                worker_url = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    let worker_url = cfg.get_worker_url(worker_url.as_deref())?;
+    let url = format!("{}/api/status", worker_url.trim_end_matches('/'));
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    eprintln!("🏓 Pinging {}...", worker_url);
+
+    let resp = client
+        .get(&url)
+        .send()
+        .context("Failed to connect to worker")?;
+
+    if resp.status().is_success() {
+        let status: serde_json::Value = resp.json().context("Failed to parse status response")?;
+        println!("{}", "=".repeat(60));
+        println!("✅ Worker Status:");
+        println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+    } else {
+        eprintln!("❌ Worker returned status: {}", resp.status());
+        std::process::exit(1);
+    }
+
+    Ok(())
+}
+
+/// List available programs on worker
+fn cmd_catalog(extra_args: &[String]) -> Result<()> {
+    let cfg = ClientConfig::load();
+    
+    let mut worker_url: Option<String> = None;
+
+    let mut i = 0;
+    while i < extra_args.len() {
+        match extra_args[i].as_str() {
+            "--worker" if i + 1 < extra_args.len() => {
+                worker_url = Some(extra_args[i + 1].clone());
+                i += 2;
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    let worker_url = cfg.get_worker_url(worker_url.as_deref())?;
+    let url = format!("{}/catalog", worker_url.trim_end_matches('/'));
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()?;
+
+    eprintln!("📚 Fetching catalog from {}...", worker_url);
+
+    let resp = client
+        .get(&url)
+        .send()
+        .context("Failed to connect to worker")?;
+
+    match resp.status() {
+        reqwest::StatusCode::OK => {
+            let catalog: serde_json::Value = resp.json().context("Failed to parse catalog")?;
+            println!("{}", "=".repeat(60));
+            println!("📚 Available Programs:");
+            println!("{}", serde_json::to_string_pretty(&catalog).unwrap_or_default());
+        }
+        reqwest::StatusCode::NOT_FOUND => {
+            println!("📚 Catalog endpoint not implemented on this worker.");
+            println!("   The worker may not support program listings.");
+        }
+        status => {
+            eprintln!("❌ Error {}: {}", status, resp.text().unwrap_or_default());
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
 }
 
 fn cmd_projects(extra_args: &[String], config_dir: &Path) -> Result<()> {
@@ -1096,8 +1558,12 @@ fn main() -> Result<()> {
     };
 
     if args.len() < 2 || args[1] == "-h" || args[1] == "--help" || args[1] == "help" {
-        eprintln!("inlayer v{} — OutLayer local WASM runner + request submission\n\n\
+        eprintln!("inlayer v{} — OutLayer local WASM runner + remote execution\n\n\
 Usage:\n\
+  inlayer exec --worker <url> --input <data> [--program <name>] [--no-pay]\n\
+                                           Execute on remote worker (auto-payment)\n\
+  inlayer ping --worker <url>              Check worker status\n\
+  inlayer catalog --worker <url>           List available programs\n\
   inlayer init                                Create inlayer.config in current directory\n\
   inlayer register <project-name> <source>    Register project on contract\n\
                                              Sources: --github <repo> <commit> | --wasm-url <url> <sha256>\n\
@@ -1111,7 +1577,12 @@ Usage:\n\
                                            Start/manage daemon (polls contract & executes WASM)\n\
                                            --tunnel: Create Cloudflare tunnel for public internet access\n\
   inlayer version                             Show version\n\n\
-Config: ./inlayer.config or ~/.inlayer/inlayer.config", env!("CARGO_PKG_VERSION"));
+Config: ./inlayer.config or ~/.inlayer/inlayer.config\n\
+Client config: ~/.inlayer/config.toml (worker_url, account_id, payment limits)\n\n\
+Environment Variables:\n\
+  OUTLAYER_WORKER_URL — override worker URL\n\
+  OUTLAYER_ACCOUNT_ID — override account ID\n\
+  OUTLAYER_CONFIG — config file path", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
 
@@ -1121,6 +1592,15 @@ Config: ./inlayer.config or ~/.inlayer/inlayer.config", env!("CARGO_PKG_VERSION"
     }
 
     match args[1].as_str() {
+        "exec" => {
+            cmd_exec(&args[2..])?;
+        }
+        "ping" => {
+            cmd_ping(&args[2..])?;
+        }
+        "catalog" => {
+            cmd_catalog(&args[2..])?;
+        }
         "init" => {
             cmd_init(&args[2..])?;
         }
