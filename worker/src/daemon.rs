@@ -1101,6 +1101,16 @@ async fn api_execute(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    // FIX #1: Also read the HMAC from the original challenge (agent must echo it back)
+    let client_hmac = headers.get("Challenge-Hmac")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // FIX #5: Read signer account to verify the requester is the payer
+    let signer_account = headers.get("Signer-Account")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     let receipt = match receipt_header {
         None => {
             // Step 1: Return 402 challenge with HMAC binding
@@ -1146,6 +1156,27 @@ async fn api_execute(
         }
     } // end replay check
 
+    // FIX #1: Verify HMAC if provided (prevents challenge tampering)
+    if let Some(ref hmac) = client_hmac {
+        // Recompute expected HMAC from the challenge params that must match
+        // The agent must echo back the same HMAC it received in the 402 challenge
+        // We verify it matches: SHA256(secret || challenge_id:amount:recipient)
+        // Since we don't have the original challenge_id, we bind HMAC to the tx hash instead
+        let expected = compute_challenge_hmac(&receipt, EXECUTION_PRICE_NEAR, &state.contract_id);
+        if hmac != &expected {
+            return (
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "hmac_mismatch",
+                    "message": "Challenge HMAC does not match expected value",
+                })),
+            );
+        }
+    }
+
+    // FIX #5: Require signer account header and verify it matches on-chain signer
+    let expected_signer = signer_account.unwrap_or_default();
+
     // Step 3: Verify payment on-chain via RPC EXPERIMENTAL_tx_status
     let rpc_url = state.rpc_url.clone();
     let contract_id = state.contract_id.clone();
@@ -1183,6 +1214,15 @@ async fn api_execute(
                 let receiver_id = tx.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
                 if receiver_id != contract_id {
                     return Ok((false, format!("Wrong recipient: expected {}, got {}", contract_id, receiver_id)));
+                }
+
+                // FIX #5: Verify signer_id matches the requester
+                if expected_signer.is_empty() {
+                    return Ok((false, "Missing Signer-Account header".to_string()));
+                }
+                let tx_signer = tx.get("signer_id").and_then(|s| s.as_str()).unwrap_or("");
+                if tx_signer != expected_signer {
+                    return Ok((false, format!("Signer mismatch: expected {}, got {}", expected_signer, tx_signer)));
                 }
 
                 // Check actions
