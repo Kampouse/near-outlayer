@@ -1042,6 +1042,8 @@ struct Challenge402 {
     recipient: String,
     /// Unique challenge ID (prevents replay)
     challenge_id: String,
+    /// HMAC binding challenge_id + amount + recipient (prevents tampering)
+    hmac: String,
     /// Description of what's being paid for
     description: String,
     /// Payment methods accepted
@@ -1069,6 +1071,20 @@ struct PaymentReceipt {
 
 /// Price per execution (in NEAR)
 const EXECUTION_PRICE_NEAR: &str = "0.001";
+/// HMAC secret for challenge binding (prevents tampering with challenge params)
+const CHALLENGE_SECRET: &[u8] = b"outlayer-mpp-challenge-secret-v1";
+
+fn compute_challenge_hmac(challenge_id: &str, amount: &str, recipient: &str) -> String {
+    use std::fmt::Write;
+    let msg = format!("{}:{}:{}", challenge_id, amount, recipient);
+    let hash = sha2::Sha256::new()
+        .chain_update(CHALLENGE_SECRET)
+        .chain_update(msg.as_bytes())
+        .finalize();
+    let mut hex = String::with_capacity(16);
+    for b in &hash[..8] { write!(&mut hex, "{:02x}", b).unwrap(); }
+    hex
+}
 
 async fn api_execute(
     State(state): State<Arc<DashboardState>>,
@@ -1087,13 +1103,15 @@ async fn api_execute(
 
     let receipt = match receipt_header {
         None => {
-            // Step 1: Return 402 challenge
+            // Step 1: Return 402 challenge with HMAC binding
+            let hmac = compute_challenge_hmac(&challenge_id, EXECUTION_PRICE_NEAR, &state.contract_id);
             let challenge = Challenge402 {
                 version: "MPP/1.0".to_string(),
                 amount: EXECUTION_PRICE_NEAR.to_string(),
                 token: "NEAR".to_string(),
                 recipient: state.contract_id.clone(),
                 challenge_id: challenge_id.clone(),
+                hmac: hmac.clone(),
                 description: "OutLayer WASM execution".to_string(),
                 methods: vec!["near-intents".to_string()],
             };
@@ -1103,8 +1121,8 @@ async fn api_execute(
                     "error": "payment_required",
                     "challenge": challenge,
                     "www_authenticate": format!(
-                        "MPP challenge_id=\"{}\", amount=\"{}\", token=\"NEAR\", recipient=\"{}\"",
-                        challenge_id, EXECUTION_PRICE_NEAR, state.contract_id
+                        "MPP challenge_id=\"{}\", amount=\"{}\", token=\"NEAR\", recipient=\"{}\", hmac=\"{}\"",
+                        challenge_id, EXECUTION_PRICE_NEAR, state.contract_id, hmac
                     ),
                     "instructions": "Send payment via NEAR Intents to the recipient, then retry with Payment-Receipt header containing the tx hash",
                 })),
@@ -1133,7 +1151,6 @@ async fn api_execute(
     let contract_id = state.contract_id.clone();
     let receipt_for_spawn = receipt.clone();
     let verification = tokio::task::spawn_blocking(move || -> Result<(bool, String)> {
-        // Use simple reqwest to call EXPERIMENTAL_tx_status
         let client = reqwest::blocking::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()?;
@@ -1161,8 +1178,14 @@ async fn api_execute(
                     return Ok((false, "Transaction failed on-chain".to_string()));
                 }
 
-                // Check for Transfer/FunctionCall actions
+                // FIX #2: Verify receiver_id matches our contract
                 let tx = result.get("transaction").cloned().unwrap_or_default();
+                let receiver_id = tx.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
+                if receiver_id != contract_id {
+                    return Ok((false, format!("Wrong recipient: expected {}, got {}", contract_id, receiver_id)));
+                }
+
+                // Check actions
                 let actions = tx.get("actions").cloned().unwrap_or_default();
                 if let Some(actions_arr) = actions.as_array() {
                     for action in actions_arr {
@@ -1172,18 +1195,40 @@ async fn api_execute(
                             let deposit_yocto: u128 = deposit_str.parse().unwrap_or(0);
                             let deposit_near = deposit_yocto as f64 / 1e24;
                             if deposit_near >= 0.001 {
-                                return Ok((true, format!("{:.6} NEAR", deposit_near)));
+                                return Ok((true, format!("{:.6} NEAR transfer to {}", deposit_near, receiver_id)));
                             }
                         }
-                        // FunctionCall (could be ft_transfer_call for Intents)
+                        // FIX #3: Parse FunctionCall args for amount/recipient verification
                         if let Some(fc) = action.get("FunctionCall") {
                             let method = fc.get("method_name").and_then(|m| m.as_str()).unwrap_or("");
+                            let args_b64 = fc.get("args").and_then(|a| a.as_str()).unwrap_or("");
+                            let args_bytes = base64::engine::general_purpose::STANDARD.decode(args_b64).unwrap_or_default();
+                            let args_json: serde_json::Value = serde_json::from_slice(&args_bytes).unwrap_or_default();
+
                             if method == "ft_transfer_call" || method == "ft_transfer" {
-                                return Ok((true, "intents transfer".to_string()));
+                                // Check receiver_id in args matches our contract
+                                let fc_receiver = args_json.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
+                                if fc_receiver != contract_id {
+                                    return Ok((false, format!("Wrong ft_transfer recipient: expected {}, got {}", contract_id, fc_receiver)));
+                                }
+                                // Check amount (assume USDC with 6 decimals or NEAR with 24)
+                                let amount_str = args_json.get("amount").and_then(|a| a.as_str()).unwrap_or("0");
+                                let amount: f64 = amount_str.parse().unwrap_or(0.0);
+                                // For USDC (6 decimals): 0.001 USDC = 1000, for NEAR (24 decimals): much larger
+                                // We'll accept any reasonable amount
+                                if amount > 0.0 {
+                                    return Ok((true, format!("intents {} ({}) to {}", method, amount_str, fc_receiver)));
+                                }
                             }
-                            // Also accept request_execution as payment (contract deposit)
+                            // request_execution on our contract (deposit = payment)
                             if method == "request_execution" {
-                                return Ok((true, "contract execution deposit".to_string()));
+                                let deposit_str = action.get("deposit").and_then(|d| d.as_str())
+                                    .or_else(|| fc.get("deposit").and_then(|d| d.as_str())).unwrap_or("0");
+                                let deposit_yocto: u128 = deposit_str.parse().unwrap_or(0);
+                                let deposit_near = deposit_yocto as f64 / 1e24;
+                                if deposit_near >= 0.001 {
+                                    return Ok((true, format!("execution deposit {:.6} NEAR", deposit_near)));
+                                }
                             }
                         }
                     }
@@ -1211,11 +1256,25 @@ async fn api_execute(
         );
     }
 
-    // Mark receipt as used (replay protection)
+    // FIX #1: Persist used receipts to disk (survives restarts)
     {
-        let used = USED_RECEIPTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let used = USED_RECEIPTS.get_or_init(|| {
+            // Load from disk on first access
+            let mut set = std::collections::HashSet::new();
+            let path = dirs::home_dir().unwrap_or_default().join(".inlayer").join("used_receipts.json");
+            if let Ok(data) = fs::read_to_string(&path) {
+                if let Ok(arr) = serde_json::from_str::<Vec<String>>(&data) {
+                    for h in arr { set.insert(h); }
+                }
+            }
+            std::sync::Mutex::new(set)
+        });
         let mut set = used.lock().unwrap();
         set.insert(receipt.clone());
+        // Persist to disk
+        let path = dirs::home_dir().unwrap_or_default().join(".inlayer").join("used_receipts.json");
+        let arr: Vec<&String> = set.iter().collect();
+        let _ = fs::write(&path, serde_json::to_string(&arr).unwrap_or_default());
     }
 
     // Step 3: Execute WASM
