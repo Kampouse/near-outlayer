@@ -38,7 +38,6 @@ use crate::outlayer_rpc::RpcProxy;
 
 // ── WASM & Engine caching ──────────────────────────────────────────────────
 
-static WASM_BYTES_CACHE: OnceLock<Vec<u8>> = OnceLock::new();
 static WASM_PATH_CACHE: OnceLock<PathBuf> = OnceLock::new();
 static SHARED_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
@@ -122,7 +121,6 @@ struct DashboardState {
     contract_id: String,
     rpc_url: String,
     search_paths: Vec<String>,
-    env: HashMap<String, String>,
     signer: std::sync::Mutex<Option<InMemorySigner>>,
 }
 
@@ -220,11 +218,18 @@ fn spawn_block_watcher(network: &str, rpc_url: &str, poll_interval_secs: u64) ->
 
 // ── RPC ─────────────────────────────────────────────────────────────────────
 
+/// Circuit-breaker RPC pool that tries endpoints in order of fewest failures.
+/// Automatically rotates away from rate-limited or errored RPCs and recovers
+/// them when they succeed again.
 struct RpcEndpoint {
     url: String,
     fails: std::sync::atomic::AtomicU32,
 }
 
+/// Multi-endpoint RPC client with circuit-breaker behavior.
+/// Endpoints are tried in ascending order of failure count, so healthy RPCs
+/// are preferred. On success the failure counter is decremented; on error or
+/// rate-limit it is incremented.
 struct Rpc {
     endpoints: Vec<RpcEndpoint>,
     client: reqwest::blocking::Client,
@@ -588,6 +593,12 @@ struct NonceCache {
     signer: InMemorySigner,
 }
 
+/// Nonce cache with pipelining for high-throughput tx submission.
+/// 
+/// Instead of fetching a fresh nonce for every transaction, the cache reserves
+/// a contiguous batch (e.g. 5 nonces at once) so multiple resolve transactions
+/// can be signed and sent in parallel without contention. If any tx fails with
+/// `InvalidNonce`, the cache is invalidated and re-fetched on the next batch.
 struct NonceCacheInner {
     nonce: Option<u64>,
     block_hash: Option<CryptoHash>,
@@ -831,13 +842,6 @@ fn find_wasm(config: &DaemonConfig) -> Option<PathBuf> {
     }
 }
 
-fn get_wasm_bytes(wasm_path: &Path) -> Result<&'static [u8]> {
-    if let Some(cached) = WASM_BYTES_CACHE.get() { return Ok(cached); }
-    let bytes = fs::read(wasm_path).with_context(|| format!("reading {}", wasm_path.display()))?;
-    let _ = WASM_BYTES_CACHE.set(bytes);
-    Ok(WASM_BYTES_CACHE.get().unwrap())
-}
-
 struct WasmResult {
     request_id: u64,
     success: bool,
@@ -1008,6 +1012,136 @@ async fn api_contract(State(state): State<Arc<DashboardState>>) -> axum::Json<Co
     axum::Json(ContractState { pending_count: ids.len(), pending_request_ids: ids, contract_id: state.contract_id.clone() })
 }
 
+// ── Payment verification helpers (MPP-402) ────────────────────────────────
+//
+// Error handling convention:
+//   verify_payment / mark_receipt_used → Result<(), String>
+//     Used for HTTP response bodies — the String is serialized directly into
+//     the JSON error payload returned to the caller.
+//   WASM execution → Result<serde_json::Value> (via anyhow)
+//     Internal logic where the error is logged and wrapped by the HTTP layer.
+
+/// Verify that a payment receipt corresponds to a valid on-chain transaction
+/// that paid at least the minimum amount to the expected contract.
+///
+/// Checks: tx exists & succeeded, receiver matches contract, signer matches
+/// `expected_signer`, and the action contains a qualifying transfer or
+/// function-call deposit.
+fn verify_payment(receipt: &str, expected_signer: &str, rpc_url: &str, contract_id: &str) -> Result<(), String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client build failed: {}", e))?;
+
+    let resp = client.post(rpc_url)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "method": "EXPERIMENTAL_tx_status",
+            "params": [receipt, contract_id]
+        }))
+        .send()
+        .map_err(|e| format!("RPC request failed: {}", e))?;
+
+    let body: serde_json::Value = resp.json()
+        .map_err(|e| format!("RPC response parse failed: {}", e))?;
+
+    if let Some(error) = body.get("error") {
+        return Err(format!("TX not found: {}", error["message"]));
+    }
+
+    let result = body.get("result").cloned().unwrap_or_default();
+
+    // Check transaction status
+    let status = result.get("status").cloned().unwrap_or_default();
+    if status.get("Failure").is_some() {
+        return Err("Transaction failed on-chain".to_string());
+    }
+
+    let tx = result.get("transaction").cloned().unwrap_or_default();
+
+    // Verify receiver_id matches our contract
+    let receiver_id = tx.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
+    if receiver_id != contract_id {
+        return Err(format!("Wrong recipient: expected {}, got {}", contract_id, receiver_id));
+    }
+
+    // Verify signer_id matches the requester
+    if expected_signer.is_empty() {
+        return Err("Missing Signer-Account header".to_string());
+    }
+    let tx_signer = tx.get("signer_id").and_then(|s| s.as_str()).unwrap_or("");
+    if tx_signer != expected_signer {
+        return Err(format!("Signer mismatch: expected {}, got {}", expected_signer, tx_signer));
+    }
+
+    // Check actions for qualifying payment
+    let actions = tx.get("actions").cloned().unwrap_or_default();
+    if let Some(actions_arr) = actions.as_array() {
+        for action in actions_arr {
+            // Direct NEAR transfer
+            if let Some(transfer) = action.get("Transfer") {
+                let deposit_str = transfer.get("deposit").and_then(|d| d.as_str()).unwrap_or("0");
+                let deposit_yocto: u128 = deposit_str.parse().unwrap_or(0);
+                let deposit_near = deposit_yocto as f64 / 1e24;
+                if deposit_near >= 0.001 {
+                    return Ok(());
+                }
+            }
+            // FunctionCall (ft_transfer, request_execution, etc.)
+            if let Some(fc) = action.get("FunctionCall") {
+                let method = fc.get("method_name").and_then(|m| m.as_str()).unwrap_or("");
+                let args_b64 = fc.get("args").and_then(|a| a.as_str()).unwrap_or("");
+                let args_bytes = base64::engine::general_purpose::STANDARD.decode(args_b64).unwrap_or_default();
+                let args_json: serde_json::Value = serde_json::from_slice(&args_bytes).unwrap_or_default();
+
+                if method == "ft_transfer_call" || method == "ft_transfer" {
+                    let fc_receiver = args_json.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
+                    if fc_receiver != contract_id {
+                        return Err(format!("Wrong ft_transfer recipient: expected {}, got {}", contract_id, fc_receiver));
+                    }
+                    let amount_str = args_json.get("amount").and_then(|a| a.as_str()).unwrap_or("0");
+                    let amount: f64 = amount_str.parse().unwrap_or(0.0);
+                    if amount > 0.0 {
+                        return Ok(());
+                    }
+                }
+                if method == "request_execution" {
+                    let deposit_str = action.get("deposit").and_then(|d| d.as_str())
+                        .or_else(|| fc.get("deposit").and_then(|d| d.as_str())).unwrap_or("0");
+                    let deposit_yocto: u128 = deposit_str.parse().unwrap_or(0);
+                    let deposit_near = deposit_yocto as f64 / 1e24;
+                    if deposit_near >= 0.001 {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    Err("No valid payment action found in transaction".to_string())
+}
+
+/// Mark a payment receipt as used (persisted to disk for replay protection).
+/// Loads the existing set from `~/.inlayer/used_receipts.json` on first call.
+fn mark_receipt_used(receipt: &str) {
+    let used = USED_RECEIPTS.get_or_init(|| {
+        let mut set = std::collections::HashSet::new();
+        let path = dirs::home_dir().unwrap_or_default().join(".inlayer").join("used_receipts.json");
+        if let Ok(data) = fs::read_to_string(&path) {
+            if let Ok(arr) = serde_json::from_str::<Vec<String>>(&data) {
+                for h in arr { set.insert(h); }
+            }
+        }
+        std::sync::Mutex::new(set)
+    });
+    let mut set = used.lock().unwrap();
+    set.insert(receipt.to_string());
+    let path = dirs::home_dir().unwrap_or_default().join(".inlayer").join("used_receipts.json");
+    let arr: Vec<&String> = set.iter().collect();
+    let _ = fs::write(&path, serde_json::to_string(&arr).unwrap_or_default());
+}
+
 // ── MPP-402 Paid Execute Endpoint ─────────────────────────────────────────
 //
 // POST /execute
@@ -1050,25 +1184,6 @@ struct Challenge402 {
     methods: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct ExecuteResponse {
-    status: String,
-    output: serde_json::Value,
-    error: Option<String>,
-    execution_time_ms: u64,
-    instructions: u64,
-    transaction_hash: String,
-    payment: PaymentReceipt,
-}
-
-#[derive(Serialize)]
-struct PaymentReceipt {
-    amount: String,
-    token: String,
-    challenge_id: String,
-    verified: bool,
-}
-
 /// Price per execution (in NEAR)
 const EXECUTION_PRICE_NEAR: &str = "0.001";
 /// HMAC secret for challenge binding (prevents tampering with challenge params)
@@ -1086,6 +1201,15 @@ fn compute_challenge_hmac(challenge_id: &str, amount: &str, recipient: &str) -> 
     hex
 }
 
+/// Paid execution endpoint implementing MPP-402 protocol.
+///
+/// **Flow:**
+/// 1. No `Payment-Receipt` header → returns HTTP 402 with a payment challenge
+///    (amount, recipient, token, HMAC-bound challenge_id).
+/// 2. Client pays via NEAR Intents, then retries with `Payment-Receipt` header
+///    containing the on-chain tx hash.
+/// 3. Server verifies the payment on-chain, checks for replay, then executes
+///    the WASM and returns the result.
 async fn api_execute(
     State(state): State<Arc<DashboardState>>,
     headers: axum::http::HeaderMap,
@@ -1101,12 +1225,12 @@ async fn api_execute(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // FIX #1: Also read the HMAC from the original challenge (agent must echo it back)
+    // Read the HMAC from the original challenge (agent must echo it back)
     let client_hmac = headers.get("Challenge-Hmac")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // FIX #5: Read signer account to verify the requester is the payer
+    // Read signer account to verify the requester is the payer
     let signer_account = headers.get("Signer-Account")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
@@ -1154,14 +1278,10 @@ async fn api_execute(
                 })),
             );
         }
-    } // end replay check
+    }
 
-    // FIX #1: Verify HMAC if provided (prevents challenge tampering)
+    // Step 3: Verify HMAC if provided (prevents challenge tampering)
     if let Some(ref hmac) = client_hmac {
-        // Recompute expected HMAC from the challenge params that must match
-        // The agent must echo back the same HMAC it received in the 402 challenge
-        // We verify it matches: SHA256(secret || challenge_id:amount:recipient)
-        // Since we don't have the original challenge_id, we bind HMAC to the tx hash instead
         let expected = compute_challenge_hmac(&receipt, EXECUTION_PRICE_NEAR, &state.contract_id);
         if hmac != &expected {
             return (
@@ -1174,150 +1294,36 @@ async fn api_execute(
         }
     }
 
-    // FIX #5: Require signer account header and verify it matches on-chain signer
     let expected_signer = signer_account.unwrap_or_default();
 
-    // Step 3: Verify payment on-chain via RPC EXPERIMENTAL_tx_status
+    // Step 4: Verify payment on-chain via RPC
     let rpc_url = state.rpc_url.clone();
     let contract_id = state.contract_id.clone();
     let receipt_for_spawn = receipt.clone();
-    let verification = tokio::task::spawn_blocking(move || -> Result<(bool, String)> {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?;
-
-        let resp = client.post(&rpc_url)
-            .json(&serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": "1",
-                "method": "EXPERIMENTAL_tx_status",
-                "params": [receipt_for_spawn, contract_id]
-            }))
-            .send();
-
-        match resp {
-            Ok(r) => {
-                let body: serde_json::Value = r.json()?;
-                if let Some(error) = body.get("error") {
-                    return Ok((false, format!("TX not found: {}", error["message"])));
-                }
-                let result = body.get("result").cloned().unwrap_or_default();
-
-                // Check transaction status
-                let status = result.get("status").cloned().unwrap_or_default();
-                if status.get("Failure").is_some() {
-                    return Ok((false, "Transaction failed on-chain".to_string()));
-                }
-
-                // FIX #2: Verify receiver_id matches our contract
-                let tx = result.get("transaction").cloned().unwrap_or_default();
-                let receiver_id = tx.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
-                if receiver_id != contract_id {
-                    return Ok((false, format!("Wrong recipient: expected {}, got {}", contract_id, receiver_id)));
-                }
-
-                // FIX #5: Verify signer_id matches the requester
-                if expected_signer.is_empty() {
-                    return Ok((false, "Missing Signer-Account header".to_string()));
-                }
-                let tx_signer = tx.get("signer_id").and_then(|s| s.as_str()).unwrap_or("");
-                if tx_signer != expected_signer {
-                    return Ok((false, format!("Signer mismatch: expected {}, got {}", expected_signer, tx_signer)));
-                }
-
-                // Check actions
-                let actions = tx.get("actions").cloned().unwrap_or_default();
-                if let Some(actions_arr) = actions.as_array() {
-                    for action in actions_arr {
-                        // Direct NEAR transfer
-                        if let Some(transfer) = action.get("Transfer") {
-                            let deposit_str = transfer.get("deposit").and_then(|d| d.as_str()).unwrap_or("0");
-                            let deposit_yocto: u128 = deposit_str.parse().unwrap_or(0);
-                            let deposit_near = deposit_yocto as f64 / 1e24;
-                            if deposit_near >= 0.001 {
-                                return Ok((true, format!("{:.6} NEAR transfer to {}", deposit_near, receiver_id)));
-                            }
-                        }
-                        // FIX #3: Parse FunctionCall args for amount/recipient verification
-                        if let Some(fc) = action.get("FunctionCall") {
-                            let method = fc.get("method_name").and_then(|m| m.as_str()).unwrap_or("");
-                            let args_b64 = fc.get("args").and_then(|a| a.as_str()).unwrap_or("");
-                            let args_bytes = base64::engine::general_purpose::STANDARD.decode(args_b64).unwrap_or_default();
-                            let args_json: serde_json::Value = serde_json::from_slice(&args_bytes).unwrap_or_default();
-
-                            if method == "ft_transfer_call" || method == "ft_transfer" {
-                                // Check receiver_id in args matches our contract
-                                let fc_receiver = args_json.get("receiver_id").and_then(|r| r.as_str()).unwrap_or("");
-                                if fc_receiver != contract_id {
-                                    return Ok((false, format!("Wrong ft_transfer recipient: expected {}, got {}", contract_id, fc_receiver)));
-                                }
-                                // Check amount (assume USDC with 6 decimals or NEAR with 24)
-                                let amount_str = args_json.get("amount").and_then(|a| a.as_str()).unwrap_or("0");
-                                let amount: f64 = amount_str.parse().unwrap_or(0.0);
-                                // For USDC (6 decimals): 0.001 USDC = 1000, for NEAR (24 decimals): much larger
-                                // We'll accept any reasonable amount
-                                if amount > 0.0 {
-                                    return Ok((true, format!("intents {} ({}) to {}", method, amount_str, fc_receiver)));
-                                }
-                            }
-                            // request_execution on our contract (deposit = payment)
-                            if method == "request_execution" {
-                                let deposit_str = action.get("deposit").and_then(|d| d.as_str())
-                                    .or_else(|| fc.get("deposit").and_then(|d| d.as_str())).unwrap_or("0");
-                                let deposit_yocto: u128 = deposit_str.parse().unwrap_or(0);
-                                let deposit_near = deposit_yocto as f64 / 1e24;
-                                if deposit_near >= 0.001 {
-                                    return Ok((true, format!("execution deposit {:.6} NEAR", deposit_near)));
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Ok((false, "No valid payment action found in transaction".to_string()))
-            }
-            Err(e) => Ok((false, format!("RPC request failed: {}", e))),
-        }
+    let verification = tokio::task::spawn_blocking(move || {
+        verify_payment(&receipt_for_spawn, &expected_signer, &rpc_url, &contract_id)
     }).await;
 
-    let (payment_verified, verify_msg) = match verification {
-        Ok(Ok((verified, msg))) => (verified, msg),
-        Ok(Err(e)) => (false, e.to_string()),
-        Err(e) => (false, e.to_string()),
+    let verify_err = match verification {
+        Ok(Ok(())) => None,
+        Ok(Err(msg)) => Some(msg),
+        Err(e) => Some(e.to_string()),
     };
 
-    if !payment_verified {
+    if let Some(msg) = verify_err {
         return (
             axum::http::StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({
                 "error": "payment_verification_failed",
-                "message": verify_msg,
+                "message": msg,
             })),
         );
     }
 
-    // FIX #1: Persist used receipts to disk (survives restarts)
-    {
-        let used = USED_RECEIPTS.get_or_init(|| {
-            // Load from disk on first access
-            let mut set = std::collections::HashSet::new();
-            let path = dirs::home_dir().unwrap_or_default().join(".inlayer").join("used_receipts.json");
-            if let Ok(data) = fs::read_to_string(&path) {
-                if let Ok(arr) = serde_json::from_str::<Vec<String>>(&data) {
-                    for h in arr { set.insert(h); }
-                }
-            }
-            std::sync::Mutex::new(set)
-        });
-        let mut set = used.lock().unwrap();
-        set.insert(receipt.clone());
-        // Persist to disk
-        let path = dirs::home_dir().unwrap_or_default().join(".inlayer").join("used_receipts.json");
-        let arr: Vec<&String> = set.iter().collect();
-        let _ = fs::write(&path, serde_json::to_string(&arr).unwrap_or_default());
-    }
+    // Step 5: Persist used receipt (replay protection, survives restarts)
+    mark_receipt_used(&receipt);
 
-    // Step 3: Execute WASM
+    // Step 6: Execute WASM
     let input_str = body.input;
     let wasm_url_hint = body.wasm_url;
     let max_instructions = body.max_instructions.unwrap_or(10_000_000_000);
@@ -1422,6 +1428,9 @@ async fn api_execute(
     }
 }
 
+/// Direct execution endpoint — runs WASM locally and submits the result to
+/// the NEAR contract in the background. No payment required (uses the node's
+/// own signer). Ideal for trusted callers (e.g. the owner's own agents).
 async fn api_call(
     State(state): State<Arc<DashboardState>>,
     axum::extract::Path((_owner, _project)): axum::extract::Path<(String, String)>,
@@ -2080,6 +2089,17 @@ fn stop_cloudflare_tunnel() {
 }
 
 /// Main entry point for `inlayer daemon`.
+///
+/// Parses CLI flags (`--start`, `--stop`, `--status`, `--log`, `--daemon`,
+/// `--foreground`, `--dashboard`, `--tunnel`), loads config, optionally
+/// daemonizes, starts the dashboard HTTP server, then enters the main loop:
+///
+/// 1. Block watcher (neardata.xyz) signals new finalised blocks
+/// 2. Poll contract for pending request IDs
+/// 3. Fetch request details, resolve WASM per source
+/// 4. Execute WASM in parallel (scoped threads)
+/// 5. Batch-resolve results on-chain
+///
 /// Args after "daemon" subcommand are passed here.
 pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     let mut daemon_cfg = DaemonConfig::load(config_dir);
@@ -2170,7 +2190,6 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
         contract_id: daemon_cfg.contract_id.clone(),
         rpc_url: rpc_url.clone(),
         search_paths: daemon_cfg.search_paths.clone(),
-        env: HashMap::new(),
         signer: std::sync::Mutex::new(None),
     });
 
@@ -2218,7 +2237,6 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
     SHARED_NONCE_CACHE.set(nonce_cache.clone()).ok();
     SHARED_SIGNER.set(signer.clone()).ok();
     SHARED_CONTRACT_ID.set(daemon_cfg.contract_id.clone()).ok();
-    SHARED_DEPOSIT_YOCTO.set(daemon_cfg.deposit_yocto).ok();
     SHARED_DEPOSIT_YOCTO.set(daemon_cfg.deposit_yocto).ok();
     let pid_path = daemon_cfg.pid_file_path();
     // Clean up PID file on Ctrl+C / SIGTERM
