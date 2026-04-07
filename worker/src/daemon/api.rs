@@ -129,6 +129,70 @@ pub(crate) async fn api_contract(State(state): State<Arc<DashboardState>>) -> Js
     Json(ContractState { pending_count: ids.len(), pending_request_ids: ids, contract_id: state.contract_id.clone() })
 }
 
+/// GET /catalog — List available WASM programs this worker can execute.
+async fn api_catalog(State(state): State<Arc<DashboardState>>) -> Json<Vec<serde_json::Value>> {
+    let mut programs = vec![];
+
+    fn scan_dir(dir: &std::path::Path, programs: &mut Vec<serde_json::Value>) {
+        // Check for compiled WASM in target/wasm32-wasip2/release/
+        let target_dir = dir.join("target").join("wasm32-wasip2").join("release");
+        if let Ok(entries) = std::fs::read_dir(&target_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".wasm") && !name.starts_with("deps") {
+                    let project_name = name.trim_end_matches(".wasm").to_string();
+                    let size = std::fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
+                    programs.push(serde_json::json!({
+                        "name": project_name,
+                        "size_bytes": size,
+                        "path": entry.path().to_string_lossy(),
+                        "type": "wasm32-wasip2"
+                    }));
+                }
+            }
+        }
+
+        // Also check root dir for loose .wasm files
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".wasm") {
+                    let project_name = name.trim_end_matches(".wasm").to_string();
+                    if !programs.iter().any(|p| p["name"] == project_name) {
+                        let size = std::fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
+                        programs.push(serde_json::json!({
+                            "name": project_name,
+                            "size_bytes": size,
+                            "path": entry.path().to_string_lossy(),
+                            "type": "wasm32-wasip2"
+                        }));
+                    }
+                }
+            }
+        }
+    }
+
+    // Scan search paths and their immediate subdirectories
+    for path in &state.search_paths {
+        let dir = std::path::Path::new(path);
+        if !dir.is_dir() { continue; }
+        
+        // Scan the path itself
+        scan_dir(dir, &mut programs);
+        
+        // Scan immediate subdirectories (e.g., workspace/project-name/)
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    scan_dir(&entry.path(), &mut programs);
+                }
+            }
+        }
+    }
+
+    Json(programs)
+}
+
 /// POST /execute - Paid execution endpoint (MPP-402).
 pub(crate) async fn api_execute(
     State(state): State<Arc<DashboardState>>,
@@ -576,6 +640,7 @@ pub(crate) fn spawn_dashboard(addr: &str, state: Arc<DashboardState>) {
             let app = Router::new()
                 .route("/call/:owner/:project", post(api_call))
                 .route("/execute", post(api_execute))
+                .route("/catalog", get(api_catalog))
                 .route("/wasm/:owner/:project", get(api_wasm))
                 .route("/api/status", get(api_status))
                 .route("/api/history", get(api_history))
