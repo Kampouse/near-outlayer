@@ -129,64 +129,45 @@ pub(crate) async fn api_contract(State(state): State<Arc<DashboardState>>) -> Js
     Json(ContractState { pending_count: ids.len(), pending_request_ids: ids, contract_id: state.contract_id.clone() })
 }
 
-/// GET /catalog — List available WASM programs this worker can execute.
-async fn api_catalog(State(state): State<Arc<DashboardState>>) -> Json<Vec<serde_json::Value>> {
+/// GET /catalog — List available WASM programs from ~/.inlayer/programs/
+async fn api_catalog() -> Json<Vec<serde_json::Value>> {
     let mut programs = vec![];
+    let programs_dir = dirs::home_dir()
+        .unwrap_or_default()
+        .join(".inlayer")
+        .join("programs");
 
-    fn scan_dir(dir: &std::path::Path, programs: &mut Vec<serde_json::Value>) {
-        // Check for compiled WASM in target/wasm32-wasip2/release/
-        let target_dir = dir.join("target").join("wasm32-wasip2").join("release");
-        if let Ok(entries) = std::fs::read_dir(&target_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".wasm") && !name.starts_with("deps") {
-                    let project_name = name.trim_end_matches(".wasm").to_string();
-                    let size = std::fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
-                    programs.push(serde_json::json!({
-                        "name": project_name,
-                        "size_bytes": size,
-                        "path": entry.path().to_string_lossy(),
-                        "type": "wasm32-wasip2"
-                    }));
-                }
-            }
-        }
+    if let Ok(entries) = std::fs::read_dir(&programs_dir) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() { continue; }
 
-        // Also check root dir for loose .wasm files
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.ends_with(".wasm") {
-                    let project_name = name.trim_end_matches(".wasm").to_string();
-                    if !programs.iter().any(|p| p["name"] == project_name) {
-                        let size = std::fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
-                        programs.push(serde_json::json!({
-                            "name": project_name,
-                            "size_bytes": size,
-                            "path": entry.path().to_string_lossy(),
-                            "type": "wasm32-wasip2"
-                        }));
-                    }
-                }
-            }
-        }
-    }
+            let wasm_path = dir.join("program.wasm");
+            let manifest_path = dir.join("manifest.json");
 
-    // Scan search paths and their immediate subdirectories
-    for path in &state.search_paths {
-        let dir = std::path::Path::new(path);
-        if !dir.is_dir() { continue; }
-        
-        // Scan the path itself
-        scan_dir(dir, &mut programs);
-        
-        // Scan immediate subdirectories (e.g., workspace/project-name/)
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                if entry.path().is_dir() {
-                    scan_dir(&entry.path(), &mut programs);
-                }
-            }
+            if !wasm_path.exists() { continue; }
+
+            let size = std::fs::metadata(&wasm_path).map(|m| m.len()).unwrap_or(0);
+
+            // Load manifest if present, otherwise use defaults
+            let manifest: serde_json::Value = std::fs::read_to_string(&manifest_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| {
+                    let name = dir.file_name().unwrap_or_default().to_string_lossy().to_string();
+                    serde_json::json!({"name": name})
+                });
+
+            programs.push(serde_json::json!({
+                "name": manifest["name"].as_str().unwrap_or("unknown"),
+                "description": manifest["description"].as_str().unwrap_or("No description available"),
+                "version": manifest["version"].as_str().unwrap_or("0.0.0"),
+                "size_kb": size / 1024,
+                "input": manifest["input"].as_str().unwrap_or("Not specified"),
+                "output": manifest["output"].as_str().unwrap_or("Not specified"),
+                "max_instructions": manifest["max_instructions"].as_u64().unwrap_or(10_000_000_000),
+                "max_memory_mb": manifest["max_memory_mb"].as_u64().unwrap_or(256),
+            }));
         }
     }
 

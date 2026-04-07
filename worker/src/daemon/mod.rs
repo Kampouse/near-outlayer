@@ -382,6 +382,20 @@ pub(crate) fn find_wasm(config: &DaemonConfig) -> Option<PathBuf> {
         if cached.exists() { return Some(cached.clone()); }
     }
 
+    // First check ~/.inlayer/programs/ for installed programs
+    let programs_dir = dirs::home_dir().unwrap_or_default().join(".inlayer").join("programs");
+    if let Ok(entries) = programs_dir.read_dir() {
+        for entry in entries.flatten() {
+            let wasm = entry.path().join("program.wasm");
+            if wasm.is_file() {
+                let size = wasm.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
+                tracing::info!("Found program: {} ({} bytes)", entry.path().file_name().unwrap_or_default().to_string_lossy(), size);
+                WASM_PATH_CACHE.set(wasm.clone()).ok();
+                return Some(wasm);
+            }
+        }
+    }
+
     let mut best: Option<(PathBuf, u64)> = None;
 
     for dir in &config.search_paths {
