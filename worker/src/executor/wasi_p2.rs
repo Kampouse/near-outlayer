@@ -338,13 +338,37 @@ pub async fn execute(
         // Register core module imports via linker.root()
         let mut root = linker.root();
         root.module("outlayer", &outlayer_module as &wasmtime::Module)?;
-        debug!("Added outlayer stub module to P2 linker");
+        debug!("Added outlayer core stub module to P2 linker");
 
         // Load and register the WASI P1→P2 adapter module
         let adapter_bytes = include_bytes!("../../wasi_adapter.wasm");
         let adapter = wasmtime::Module::from_binary(&engine, adapter_bytes)?;
         root.module("wasi-snapshot-preview1", &adapter as &wasmtime::Module)?;
         debug!("Added WASI P1 adapter module to P2 linker");
+    }
+
+    // Also provide component-level instance for lisp-rlm P2 components
+    // that import "outlayer:api/outlayer" at the component boundary.
+    // Each function is a stub returning s32(0); the real implementations
+    // flow through the core module registered above.
+    {
+        use wasmtime::component::Val as CVal;
+        let mut inst = linker.instance("outlayer:api/outlayer")?;
+        let names: &[&str] = &[
+            "view", "call", "transfer", "http-get", "storage-set", "storage-get",
+            "storage-has", "storage-delete", "storage-increment", "env-signer",
+            "env-predecessor", "storage-decrement", "storage-set-if-absent",
+            "storage-set-if-equals", "storage-list-keys", "storage-clear-all",
+            "storage-set-worker", "storage-get-worker", "storage-set-worker-public",
+            "storage-get-worker-from-project",
+        ];
+        for &name in names {
+            inst.func_new(name, move |_caller, _params, results| {
+                results[0] = CVal::S32(0);
+                Ok(())
+            })?;
+        }
+        debug!("Added outlayer:api/outlayer component instance to P2 linker");
     }
 
     // Add NEAR RPC host functions if context has RPC proxy
