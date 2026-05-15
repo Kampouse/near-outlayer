@@ -93,14 +93,12 @@ struct HostState {
     vrf_state: Option<VrfHostState>,
     /// Wallet state (only present if wallet_id in execution request)
     wallet_state: Option<WalletHostState>,
+    /// Outlayer flat host state (for lisp-rlm P2 components using outlayer:api/host)
+    outlayer_state: Option<crate::outlayer_flat::OutlayerHostState>,
     /// Counter for timed-out HTTP requests (shared with spawned tasks)
     http_timeout_count: Arc<std::sync::atomic::AtomicU32>,
     /// Engine handle to force epoch interrupt when aborting due to HTTP abuse (Engine::clone is Arc)
     engine_handle: &'static Engine,
-    /// Component instance (set after instantiation, used to lazily extract memory)
-    component_instance: Option<wasmtime::component::Instance>,
-    /// Cached memory (extracted from component_instance on first outlayer call)
-    memory: Arc<Mutex<Option<wasmtime::Memory>>>,
 }
 
 impl WasiView for HostState {
@@ -351,226 +349,13 @@ pub async fn execute(
         debug!("Added WASI P1 adapter module to P2 linker");
     }
 
-    // Provide component-level instance for lisp-rlm P2 components
-    // that import "outlayer:api/host" at the component boundary.
-    // Real implementations for storage + HTTP; stubs for the rest.
+    // Register outlayer:api/host via bindgen-generated typed bindings
+    // This handles all memory lifting/lowering automatically
     {
-        use wasmtime::component::Val as CVal;
-        let mut inst = linker.instance("outlayer:api/host")?;
-
-        // storage-set(key_ptr, key_len, val_ptr, val_len) -> s32
-        // Writes key=value to local storage. Returns 0 on success.
-        inst.func_new("storage-set", |mut caller, params, results| {
-            let key_ptr = match params[0] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let key_len = match params[1] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let val_ptr = match params[2] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let val_len = match params[3] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            
-            // Access memory from HostState
-            let memory = caller.data().memory.lock().ok().and_then(|g| g.clone());
-            if let Some(mem) = memory {
-                let data = mem.data(&caller);
-                if key_ptr + key_len <= data.len() && val_ptr + val_len <= data.len() {
-                    let key = std::str::from_utf8(&data[key_ptr..key_ptr+key_len]).unwrap_or("");
-                    let val = &data[val_ptr..val_ptr+val_len];
-                    
-                    let dir = std::env::var("STORAGE_DIR").unwrap_or_else(|_| "./storage".into());
-                    let path = std::path::Path::new(&dir).join(key);
-                    if let Some(parent) = path.parent() {
-                        std::fs::create_dir_all(parent).ok();
-                    }
-                    match std::fs::write(&path, val) {
-                        Ok(_) => { results[0] = CVal::S32(0); }
-                        Err(_) => { results[0] = CVal::S32(-1); }
-                    }
-                } else {
-                    results[0] = CVal::S32(-1);
-                }
-            } else {
-                results[0] = CVal::S32(-1);
-            }
-            Ok(())
+        crate::outlayer_flat::add_outlayer_to_linker(&mut linker, |state: &mut HostState| {
+            state.outlayer_state.as_mut().expect("outlayer state")
         })?;
-
-        // storage-get(key_ptr, key_len, val_ptr, buf_size, written_ptr) -> s32
-        // Reads key from local storage into buffer. Returns bytes written or -1.
-        inst.func_new("storage-get", |mut caller, params, results| {
-            let key_ptr = match params[0] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let key_len = match params[1] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let val_ptr = match params[2] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let buf_size = match params[3] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let written_ptr = match params[4] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            
-            let memory = caller.data().memory.lock().ok().and_then(|g| g.clone());
-            if let Some(mem) = memory.clone() {
-                let data = mem.data(&caller);
-                if key_ptr + key_len <= data.len() {
-                    let key = std::str::from_utf8(&data[key_ptr..key_ptr+key_len]).unwrap_or("");
-                    let dir = std::env::var("STORAGE_DIR").unwrap_or_else(|_| "./storage".into());
-                    let path = std::path::Path::new(&dir).join(key);
-                    if let Ok(val) = std::fs::read(&path) {
-                        let write_len = val.len().min(buf_size);
-                        // Need mutable access to write response
-                        let mem_mut = mem.data_mut(&mut caller);
-                        if val_ptr + write_len <= mem_mut.len() && written_ptr + 4 <= mem_mut.len() {
-                            mem_mut[val_ptr..val_ptr+write_len].copy_from_slice(&val[..write_len]);
-                            // Write length to written_ptr as i32 LE
-                            let len_bytes = (write_len as i32).to_le_bytes();
-                            mem_mut[written_ptr..written_ptr+4].copy_from_slice(&len_bytes);
-                            results[0] = CVal::S32(0);
-                        } else {
-                            results[0] = CVal::S32(-1);
-                        }
-                    } else {
-                        results[0] = CVal::S32(-1); // key not found
-                    }
-                } else {
-                    results[0] = CVal::S32(-1);
-                }
-            } else {
-                results[0] = CVal::S32(-1);
-            }
-            Ok(())
-        })?;
-
-        // storage-has(key_ptr, key_len) -> s32
-        // Returns 1 if key exists, 0 otherwise.
-        inst.func_new("storage-has", |mut caller, params, results| {
-            let key_ptr = match params[0] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let key_len = match params[1] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let memory = caller.data().memory.lock().ok().and_then(|g| g.clone());
-            if let Some(mem) = memory {
-                let data = mem.data(&caller);
-                if key_ptr + key_len <= data.len() {
-                    let key = std::str::from_utf8(&data[key_ptr..key_ptr+key_len]).unwrap_or("");
-                    let dir = std::env::var("STORAGE_DIR").unwrap_or_else(|_| "./storage".into());
-                    let path = std::path::Path::new(&dir).join(key);
-                    results[0] = CVal::S32(if path.exists() { 1 } else { 0 });
-                } else { results[0] = CVal::S32(0); }
-            } else { results[0] = CVal::S32(0); }
-            Ok(())
-        })?;
-
-        // storage-delete(key_ptr, key_len) -> s32
-        inst.func_new("storage-delete", |mut caller, params, results| {
-            let key_ptr = match params[0] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let key_len = match params[1] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let memory = caller.data().memory.lock().ok().and_then(|g| g.clone());
-            if let Some(mem) = memory {
-                let data = mem.data(&caller);
-                if key_ptr + key_len <= data.len() {
-                    let key = std::str::from_utf8(&data[key_ptr..key_ptr+key_len]).unwrap_or("");
-                    let dir = std::env::var("STORAGE_DIR").unwrap_or_else(|_| "./storage".into());
-                    let path = std::path::Path::new(&dir).join(key);
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-            results[0] = CVal::S32(0);
-            Ok(())
-        })?;
-
-        // http-get(url_ptr, url_len, resp_ptr, buf_size, flags) -> s32
-        // Makes a blocking HTTP GET, writes response to buffer. Returns bytes written or -1.
-        // Uses reqwest::blocking via spawn_blocking to avoid tokio panic.
-        inst.func_new("http-get", move |mut caller, params, results| {
-            let url_ptr = match params[0] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let url_len = match params[1] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let resp_ptr = match params[2] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let buf_size = match params[3] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            
-            let memory = caller.data().memory.lock().ok().and_then(|g| g.clone());
-            if let Some(mem) = memory {
-                let data = mem.data(&caller);
-                if url_ptr + url_len <= data.len() {
-                    let url_bytes = &data[url_ptr..url_ptr+url_len];
-                    let url = match std::str::from_utf8(url_bytes) {
-                        Ok(u) => u.to_string(),
-                        Err(_) => { results[0] = CVal::S32(-1); return Ok(()); }
-                    };
-                    
-                    // Blocking HTTP GET
-                    let response = std::thread::scope(|s| {
-                        s.spawn(|| {
-                            reqwest::blocking::Client::builder()
-                                .timeout(std::time::Duration::from_secs(10))
-                                .build()
-                                .ok()?
-                                .get(&url)
-                                .send()
-                                .ok()?
-                                .bytes()
-                                .ok()
-                        }).join().ok().flatten()
-                    });
-                    
-                    match response {
-                        Some(body) => {
-                            let write_len = body.len().min(buf_size);
-                            let mem_mut = mem.data_mut(&mut caller);
-                            if resp_ptr + write_len <= mem_mut.len() {
-                                mem_mut[resp_ptr..resp_ptr+write_len].copy_from_slice(&body[..write_len]);
-                                results[0] = CVal::S32(write_len as i32);
-                            } else {
-                                results[0] = CVal::S32(-1);
-                            }
-                        }
-                        None => results[0] = CVal::S32(-1),
-                    }
-                } else { results[0] = CVal::S32(-1); }
-            } else { results[0] = CVal::S32(-1); }
-            Ok(())
-        })?;
-
-        // env-signer(ptr, len, flags) -> s32 — returns "local" as signer
-        inst.func_new("env-signer", |mut caller, params, results| {
-            let ptr = match params[0] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let len = match params[1] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let memory = caller.data().memory.lock().ok().and_then(|g| g.clone());
-            if let Some(mem) = memory {
-                let signer = b"local";
-                let write_len = signer.len().min(len);
-                let mem_mut = mem.data_mut(&mut caller);
-                if ptr + write_len <= mem_mut.len() {
-                    mem_mut[ptr..ptr+write_len].copy_from_slice(&signer[..write_len]);
-                    results[0] = CVal::S32(write_len as i32);
-                } else { results[0] = CVal::S32(-1); }
-            } else { results[0] = CVal::S32(-1); }
-            Ok(())
-        })?;
-
-        // env-predecessor(ptr, len, flags) -> s32 — returns "local"
-        inst.func_new("env-predecessor", |mut caller, params, results| {
-            let ptr = match params[0] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let len = match params[1] { CVal::S32(v) => v as usize, _ => return Ok(()) };
-            let memory = caller.data().memory.lock().ok().and_then(|g| g.clone());
-            if let Some(mem) = memory {
-                let pred = b"local";
-                let write_len = pred.len().min(len);
-                let mem_mut = mem.data_mut(&mut caller);
-                if ptr + write_len <= mem_mut.len() {
-                    mem_mut[ptr..ptr+write_len].copy_from_slice(&pred[..write_len]);
-                    results[0] = CVal::S32(write_len as i32);
-                } else { results[0] = CVal::S32(-1); }
-            } else { results[0] = CVal::S32(-1); }
-            Ok(())
-        })?;
-
-        // Stubs for remaining functions (return 0)
-        let stub_funcs: &[(&str, usize)] = &[
-            ("view", 8), ("call", 13), ("transfer", 10),
-            ("storage-increment", 6), ("storage-decrement", 6),
-            ("storage-set-if-absent", 4), ("storage-set-if-equals", 8),
-            ("storage-list-keys", 5), ("storage-clear-all", 0),
-            ("storage-set-worker", 4), ("storage-get-worker", 5),
-            ("storage-set-worker-public", 4), ("storage-get-worker-from-project", 7),
-        ];
-        for &(name, _) in stub_funcs {
-            inst.func_new(name, move |_caller, _params, results| {
-                results[0] = CVal::S32(0);
-                Ok(())
-            })?;
-        }
-        debug!("Added outlayer:api/host component instance to P2 linker (real storage + HTTP)");
+        debug!("Added outlayer:api/host via bindgen (real storage + HTTP + env)");
     }
 
     // Add NEAR RPC host functions if context has RPC proxy
@@ -775,10 +560,9 @@ pub async fn execute(
         payment_state,
         vrf_state,
         wallet_state,
+        outlayer_state: Some(crate::outlayer_flat::OutlayerHostState::new()),
         http_timeout_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         engine_handle: engine,
-        component_instance: None,
-        memory: Arc::new(Mutex::new(None)),
     };
 
     // Create store with fuel limit + epoch deadline
@@ -802,28 +586,14 @@ pub async fn execute(
 
     // Instantiate and execute component
     debug!("Instantiating component");
-    // Instantiate component directly (instead of via Command::instantiate_async)
-    // so we can extract the memory handle for outlayer host functions
-    let component_instance = linker.instantiate_async(&mut store, &component).await
+    let command = Command::instantiate_async(&mut store, &component, &linker)
+        .await
         .map_err(|e| {
             tracing::error!("Failed to instantiate component: {}", e);
             tracing::error!("Error details: {:?}", e);
             e
         })
         .context("Failed to instantiate component")?;
-
-    // Store component instance reference
-    store.data_mut().component_instance = Some(component_instance);
-    
-    // TODO: Extract core memory from the component instance.
-    // In wasmtime 28, component::Instance doesn't expose core memory directly.
-    // Need to find a way to get wasmtime::Memory from the instantiated component.
-    // For now, outlayer host functions that need memory (storage, HTTP) return -1.
-    debug!("Note: outlayer host memory access not yet wired (stubs return -1)");
-
-    // Wrap in Command for standard WASI execution
-    let command = wasmtime_wasi::bindings::Command::new(&mut store, &component_instance)
-        .context("Failed to create Command from component instance")?;
 
     debug!("Running wasi:cli/run");
     let execution_result = command

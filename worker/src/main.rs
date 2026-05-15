@@ -11,6 +11,7 @@ mod near_client;
 mod registration;
 mod outlayer_rpc;
 mod outlayer_storage;
+mod outlayer_flat;
 mod outlayer_payment;
 mod outlayer_vrf;
 mod outlayer_wallet;
