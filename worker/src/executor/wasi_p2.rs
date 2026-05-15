@@ -20,6 +20,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tracing::debug;
 use wasmtime::component::{Component, Linker};
 use wasmtime::*;
+use wasm_encoder::ValType as WVal;
+const W: WVal = WVal::I32;
 
 /// Global WASM engine for WASI P2 components (component model)
 ///
@@ -279,6 +281,71 @@ pub async fn execute(
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wasmtime_wasi::add_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+
+    // Provide core module imports that the component needs:
+    // - wasi-snapshot-preview1: WASI P1 adapter module
+    // - outlayer: host function stubs
+    {
+        // Build stub outlayer core module with all 20 host functions
+        let mut outlayer_module = wasmtime::Module::new(&engine, {
+            // Create a minimal core module that exports all outlayer functions
+            let mut build = wasm_encoder::Module::new();
+            // Type section
+            let mut types = wasm_encoder::TypeSection::new();
+            types.ty().function(vec![], vec![W]); // type 0: () -> i32
+            types.ty().function(vec![W;2], vec![W]); // type 1
+            types.ty().function(vec![W;3], vec![W]); // type 2
+            types.ty().function(vec![W;4], vec![W]); // type 3
+            types.ty().function(vec![W;5], vec![W]); // type 4
+            types.ty().function(vec![W;6], vec![W]); // type 5
+            types.ty().function(vec![W;7], vec![W]); // type 6
+            types.ty().function(vec![W;8], vec![W]); // type 7
+            types.ty().function(vec![W;10], vec![W]); // type 8
+            types.ty().function(vec![W;14], vec![W]); // type 9
+            build.section(&types);
+            // Function section (all use type 0 = return 0)
+            let mut funcs = wasm_encoder::FunctionSection::new();
+            // 0 params → type 0, 2 params → type 1, etc
+            let func_types: &[u32] = &[7,9,8,4,3,4,1,1,5,2,2,5,3,7,4,0,3,4,3,6];
+            for &ty in func_types { funcs.function(ty); }
+            build.section(&funcs);
+            // Export section
+            let mut exports = wasm_encoder::ExportSection::new();
+            let names: &[&str] = &[
+                "view","call","transfer","http_get","storage_set","storage_get",
+                "storage_has","storage_delete","storage_increment","env_signer",
+                "env_predecessor","storage_decrement","storage_set_if_absent",
+                "storage_set_if_equals","storage_list_keys","storage_clear_all",
+                "storage_set_worker","storage_get_worker","storage_set_worker_public",
+                "storage_get_worker_from_project",
+            ];
+            for (i, name) in names.iter().enumerate() {
+                exports.export(name, wasm_encoder::ExportKind::Func, i as u32);
+            }
+            build.section(&exports);
+            // Code section (all return i32(0))
+            let mut code = wasm_encoder::CodeSection::new();
+            let param_counts: &[usize] = &[8,14,10,5,4,5,2,2,6,3,3,6,4,8,5,0,4,5,4,7];
+            for &n in param_counts {
+                let mut fb = wasm_encoder::Function::new(vec![]);
+                fb.instruction(&wasm_encoder::Instruction::I32Const(0));
+                fb.instruction(&wasm_encoder::Instruction::End);
+                code.function(&fb);
+            }
+            build.section(&code);
+            build.finish()
+        })?;
+        // Register core module imports via linker.root()
+        let mut root = linker.root();
+        root.module("outlayer", &outlayer_module as &wasmtime::Module)?;
+        debug!("Added outlayer stub module to P2 linker");
+
+        // Load and register the WASI P1→P2 adapter module
+        let adapter_bytes = include_bytes!("../../wasi_adapter.wasm");
+        let adapter = wasmtime::Module::from_binary(&engine, adapter_bytes)?;
+        root.module("wasi-snapshot-preview1", &adapter as &wasmtime::Module)?;
+        debug!("Added WASI P1 adapter module to P2 linker");
+    }
 
     // Add NEAR RPC host functions if context has RPC proxy
     let rpc_state = if let Some(ctx) = exec_ctx {
@@ -572,6 +639,19 @@ pub async fn execute(
             Ok((output, fuel_consumed, refund_usd))
         }
         Ok(Err(_)) | Err(_) => {
+            // Check for normal WASI exit (proc_exit(0))
+            match &execution_result {
+                Err(e) => {
+                    if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                        if exit.0 == 0 {
+                            let output = stdout_pipe.contents().to_vec();
+                            debug!("Component exited normally (I32Exit(0)), output: {} bytes", output.len());
+                            return Ok((output, fuel_consumed, refund_usd));
+                        }
+                    }
+                }
+                _ => {}
+            }
             // Check if this was an epoch interruption (timeout)
             let err_ref = match &execution_result {
                 Err(e) => Some(e),

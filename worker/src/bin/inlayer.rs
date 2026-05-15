@@ -218,7 +218,7 @@ fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option
     };
 
     // Auto-detect: try P1 first, then P2
-    let build_target = if wasm_bytes.len() > 4 && wasm_bytes[0] == 0x00 && wasm_bytes[1] == 0x61 && wasm_bytes[2] == 0x73 && wasm_bytes[3] == 0x6d {
+    let build_target = if wasm_bytes.len() > 4 && wasm_bytes[0] == 0x00 && wasm_bytes[1] == 0x61 && wasm_bytes[2] == 0x73 && wasm_bytes[3] == 0x6d && wasm_bytes[4] == 0x01 {
         // Core WASM module — try P1
         "wasm32-wasip1"
     } else {

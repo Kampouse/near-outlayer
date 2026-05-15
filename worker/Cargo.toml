@@ -36,6 +36,7 @@ near-jsonrpc-primitives = "0.26"
 # wasmtime-wasi = { version = "37" } 
 
 wasmtime = { version = "28", features = ["component-model", "async"] }
+wasm-encoder = "0.248.0"
 wasmtime-wasi = "28"
 wasmtime-wasi-http = "28"
 hyper = "1.8"

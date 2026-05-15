@@ -321,7 +321,7 @@ pub(crate) async fn api_execute(
         env.insert("PAYMENT_VERIFIED".into(), "true".into());
         env.insert("PAYMENT_RECEIPT".into(), receipt.clone());
 
-        let detected_target = if wasm_bytes.len() > 4 && wasm_bytes[0] == 0x00 && wasm_bytes[1] == 0x61 && wasm_bytes[2] == 0x73 && wasm_bytes[3] == 0x6d {
+        let detected_target = if wasm_bytes.len() > 4 && wasm_bytes[0] == 0x00 && wasm_bytes[1] == 0x61 && wasm_bytes[2] == 0x73 && wasm_bytes[3] == 0x6d && wasm_bytes[4] == 0x01 {
             Some("wasm32-wasip1")
         } else {
             Some("wasm32-wasip2")
@@ -447,7 +447,7 @@ pub(crate) async fn api_call(
         env.insert("REQUEST_TYPE".into(), "http".into());
 
         // Auto-detect P1 vs P2 from wasm magic bytes
-        let detected_target = if wasm_bytes.len() > 4 && wasm_bytes[0] == 0x00 && wasm_bytes[1] == 0x61 && wasm_bytes[2] == 0x73 && wasm_bytes[3] == 0x6d {
+        let detected_target = if wasm_bytes.len() > 4 && wasm_bytes[0] == 0x00 && wasm_bytes[1] == 0x61 && wasm_bytes[2] == 0x73 && wasm_bytes[3] == 0x6d && wasm_bytes[4] == 0x01 {
             Some("wasm32-wasip1")
         } else {
             Some("wasm32-wasip2")
