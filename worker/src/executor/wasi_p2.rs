@@ -347,28 +347,31 @@ pub async fn execute(
         debug!("Added WASI P1 adapter module to P2 linker");
     }
 
-    // Also provide component-level instance for lisp-rlm P2 components
-    // that import "outlayer:api/outlayer" at the component boundary.
-    // Each function is a stub returning s32(0); the real implementations
-    // flow through the core module registered above.
+    // Provide component-level instance for lisp-rlm P2 components
+    // that import "outlayer:api/host" at the component boundary.
+    // Uses typed func_wrap with correct parameter counts for each function.
     {
         use wasmtime::component::Val as CVal;
-        let mut inst = linker.instance("outlayer:api/outlayer")?;
-        let names: &[&str] = &[
-            "view", "call", "transfer", "http-get", "storage-set", "storage-get",
-            "storage-has", "storage-delete", "storage-increment", "env-signer",
-            "env-predecessor", "storage-decrement", "storage-set-if-absent",
-            "storage-set-if-equals", "storage-list-keys", "storage-clear-all",
-            "storage-set-worker", "storage-get-worker", "storage-set-worker-public",
-            "storage-get-worker-from-project",
+        let mut inst = linker.instance("outlayer:api/host")?;
+        // (name, param_count) — all return s32
+        let funcs: &[(&str, usize)] = &[
+            ("view", 8), ("call", 13), ("transfer", 10),
+            ("http-get", 5), ("storage-set", 4), ("storage-get", 5),
+            ("storage-has", 2), ("storage-delete", 2),
+            ("storage-increment", 6), ("storage-decrement", 6),
+            ("env-signer", 3), ("env-predecessor", 3),
+            ("storage-set-if-absent", 4), ("storage-set-if-equals", 8),
+            ("storage-list-keys", 5), ("storage-clear-all", 0),
+            ("storage-set-worker", 4), ("storage-get-worker", 5),
+            ("storage-set-worker-public", 4), ("storage-get-worker-from-project", 7),
         ];
-        for &name in names {
+        for &(name, _nparams) in funcs {
             inst.func_new(name, move |_caller, _params, results| {
                 results[0] = CVal::S32(0);
                 Ok(())
             })?;
         }
-        debug!("Added outlayer:api/outlayer component instance to P2 linker");
+        debug!("Added outlayer:api/host component instance to P2 linker");
     }
 
     // Add NEAR RPC host functions if context has RPC proxy
