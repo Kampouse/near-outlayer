@@ -103,12 +103,15 @@ impl Rpc {
                     };
                     let limits = req.get("resource_limits");
                     let source = parse_source(&req);
+                    let build_target = req.get("build_target").and_then(|v| v.as_str()).map(|s| s.to_string())
+                        .or_else(|| source.build_target());
                     Ok(RequestInfo {
                         input: input_str,
                         max_instructions: limits.and_then(|l| l.get("max_instructions")).and_then(|v| v.as_u64()).unwrap_or(10_000_000_000),
                         max_memory_mb: limits.and_then(|l| l.get("max_memory_mb")).and_then(|v| v.as_u64()).unwrap_or(256) as u32,
                         max_execution_seconds: limits.and_then(|l| l.get("max_execution_seconds")).and_then(|v| v.as_u64()).unwrap_or(60),
                         source,
+                        build_target,
                     })
                 });
             (req_id, result)

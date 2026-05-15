@@ -83,6 +83,10 @@ pub async fn execute(
     let mut linker = wasmtime::Linker::new(&engine);
     preview1::add_to_linker_async(&mut linker, |t: &mut WasiP1Ctx| t)?;
 
+    // Add outlayer host function stubs — use define_unknown_imports_as_default_values
+    // to auto-create stubs for all non-WASI imports
+    linker.define_unknown_imports_as_default_values(&module)?;
+
     // Prepare stdin/stdout pipes
     let stdin_pipe = wasmtime_wasi::pipe::MemoryInputPipe::new(input_data.to_vec());
     let stdout_pipe =
@@ -124,10 +128,16 @@ pub async fn execute(
 
     // Instantiate module
     debug!("Instantiating WASI P1 module");
-    let instance = linker
+    let instance = match linker
         .instantiate_async(&mut store, &module)
         .await
-        .context("Failed to instantiate WASI P1 module")?;
+    {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("❌ P1 instantiation error: {}", e);
+            return Err(anyhow::anyhow!("Failed to instantiate WASI P1 module: {}", e));
+        }
+    };
 
     // Get and call _start function (WASI entry point from main())
     debug!("Calling _start");
@@ -157,6 +167,16 @@ pub async fn execute(
     if let Err(e) = call_result {
         let error_str = e.to_string();
         tracing::error!("❌ WASI P1 _start failed: {}", error_str);
+        eprintln!("❌ WASI P1 _start failed: {}", error_str);
+        // Check for I32Exit (normal WASI exit)
+        if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+            if exit.0 == 0 {
+                let stdout_contents = stdout_pipe.contents();
+                let fuel_consumed = limits.max_instructions - store.get_fuel().unwrap_or(0);
+                tracing::info!("📦 WASM exited normally (status 0), output: {} bytes", stdout_contents.len());
+                return Ok((stdout_contents.to_vec(), fuel_consumed, None));
+            }
+        }
 
         // Read stderr to get program's error message
         let stderr_contents = stderr_pipe.contents();

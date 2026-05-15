@@ -113,11 +113,20 @@ pub(crate) struct DashboardStatusInner {
 #[derive(Debug, Clone)]
 pub(crate) enum ParsedSource {
     /// Use WASM from a URL (download + cache)
-    WasmUrl { url: String, hash: String },
+    WasmUrl { url: String, hash: String, build_target: Option<String> },
     /// Use registered project WASM (match by project_id in search paths)
     Project { project_id: String },
     /// No source info — fall back to default WASM discovery
     Unknown,
+}
+
+impl ParsedSource {
+    pub(crate) fn build_target(&self) -> Option<String> {
+        match self {
+            ParsedSource::WasmUrl { build_target, .. } => build_target.clone(),
+            _ => None,
+        }
+    }
 }
 
 /// Request info fetched from contract.
@@ -127,6 +136,7 @@ pub(crate) struct RequestInfo {
     pub(crate) max_memory_mb: u32,
     pub(crate) max_execution_seconds: u64,
     pub(crate) source: ParsedSource,
+    pub(crate) build_target: Option<String>,
 }
 
 /// WASM execution result.
@@ -187,12 +197,13 @@ pub(crate) fn parse_source(req: &serde_json::Value) -> ParsedSource {
         },
     };
 
-    // WasmUrl: { "WasmUrl": { "url": "...", "hash": "..." } }
+    // WasmUrl: { "WasmUrl": { "url": "...", "hash": "...", "build_target": "..." } }
     if let Some(wu) = source.get("WasmUrl") {
         let url = wu.get("url").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let hash = wu.get("hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let build_target = wu.get("build_target").and_then(|v| v.as_str()).map(|s| s.to_string());
         if !url.is_empty() {
-            return ParsedSource::WasmUrl { url, hash };
+            return ParsedSource::WasmUrl { url, hash, build_target };
         }
     }
 
@@ -216,7 +227,7 @@ pub(crate) fn parse_source(req: &serde_json::Value) -> ParsedSource {
 /// Resolve WASM bytes for a given request source.
 pub(crate) fn resolve_wasm(source: &ParsedSource, config: &DaemonConfig) -> Option<Vec<u8>> {
     match source {
-        ParsedSource::WasmUrl { url, hash } => {
+        ParsedSource::WasmUrl { url, hash, .. } => {
             resolve_wasm_from_url(url, hash)
         }
         ParsedSource::Project { project_id } => {
@@ -235,9 +246,37 @@ fn resolve_wasm_from_url(url: &str, _hash: &str) -> Option<Vec<u8>> {
     // Extract filename from URL (e.g. "nostr-identity-zkp-tee-wasip2.wasm")
     let filename = url.rsplit('/').next().unwrap_or("");
 
-    // Search local paths first
+    let home = dirs::home_dir().unwrap_or_default();
+
+    // 1. Try by hash in ~/.inlayer/programs/{hash}.wasm
+    if !_hash.is_empty() {
+        let by_hash = home.join(".inlayer").join("programs").join(format!("{}.wasm", _hash));
+        if by_hash.is_file() {
+            tracing::info!("   📦 Local WASM (by hash): {}", by_hash.display());
+            return fs::read(&by_hash).ok();
+        }
+    }
+
+    // 2. Try by filename in ~/.inlayer/programs/{name}/program.wasm
+    let programs_dir = home.join(".inlayer").join("programs");
     if !filename.is_empty() {
-        let home = dirs::home_dir().unwrap_or_default();
+        let name = filename.strip_suffix(".wasm").unwrap_or(filename);
+        // Check {name}/program.wasm
+        let prog = programs_dir.join(name).join("program.wasm");
+        if prog.is_file() {
+            tracing::info!("   📦 Local WASM (programs dir): {}", prog.display());
+            return fs::read(&prog).ok();
+        }
+        // Check {name}.wasm
+        let top = programs_dir.join(format!("{}.wasm", name));
+        if top.is_file() {
+            tracing::info!("   📦 Local WASM (programs dir): {}", top.display());
+            return fs::read(&top).ok();
+        }
+    }
+
+    // 3. Original search paths
+    if !filename.is_empty() {
         let search_dirs = vec![
             home.join(".openclaw/workspace"),
             home.join(".openclaw/workspace/nostr-identity"),
@@ -466,6 +505,7 @@ pub(crate) fn execute_single_wasm(
     rpc_url: &str,
     env_vars: &HashMap<String, String>,
     req_limits: &RequestInfo,
+    build_target: Option<&str>,
 ) -> WasmResult {
     let storage_dir = env::var("STORAGE_DIR").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("./storage"));
     fs::create_dir_all(&storage_dir).ok();
@@ -510,7 +550,7 @@ pub(crate) fn execute_single_wasm(
 
     let result = rt.block_on(executor.execute(
         wasm_bytes, Some(&wasm_checksum), input.as_bytes(), &limits,
-        env, Some("wasm32-wasip2"), &ResponseFormat::Text,
+        env, build_target.or(Some("wasm32-wasip2")), &ResponseFormat::Text,
         None, None, None,
     ));
     drop(executor);
@@ -786,7 +826,7 @@ pub fn run_daemon(args: &[String], config_dir: &Path) -> Result<()> {
                                     env.insert("REQUEST_TYPE".into(), "blockchain".into());
                                     let rpc_url = rpc_url.clone();
                                     Some(s.spawn(move || {
-                                        execute_single_wasm(&wasm_bytes, req_id, &info.input, &rpc_url, &env, &info)
+                                        execute_single_wasm(&wasm_bytes, req_id, &info.input, &rpc_url, &env, &info, info.build_target.as_deref())
                                     }))
                                 }
                                 Err(e) => { log(&format!("   Request #{} info failed: {}", req_id, e)); None }

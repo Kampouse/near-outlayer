@@ -299,7 +299,7 @@ pub(crate) async fn api_execute(
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         let source = if let Some(ref url) = wasm_url_hint {
-            ParsedSource::WasmUrl { url: url.clone(), hash: String::new() }
+            ParsedSource::WasmUrl { url: url.clone(), hash: String::new(), build_target: None }
         } else {
             ParsedSource::Unknown
         };
@@ -314,13 +314,19 @@ pub(crate) async fn api_execute(
             max_memory_mb,
             max_execution_seconds: 60,
             source: ParsedSource::Unknown,
+            build_target: None,
         };
         let mut env = HashMap::new();
         env.insert("REQUEST_TYPE".into(), "http".into());
         env.insert("PAYMENT_VERIFIED".into(), "true".into());
         env.insert("PAYMENT_RECEIPT".into(), receipt.clone());
 
-        let wasm_result = execute_single_wasm(&wasm_bytes, 0, &input_str, &rpc_url, &env, &info);
+        let detected_target = if wasm_bytes.len() > 4 && wasm_bytes[0] == 0x00 && wasm_bytes[1] == 0x61 && wasm_bytes[2] == 0x73 && wasm_bytes[3] == 0x6d {
+            Some("wasm32-wasip1")
+        } else {
+            Some("wasm32-wasip2")
+        };
+        let wasm_result = execute_single_wasm(&wasm_bytes, 0, &input_str, &rpc_url, &env, &info, detected_target);
         let elapsed = start.elapsed();
 
         // Submit to contract in background (settled execution record)
@@ -420,7 +426,7 @@ pub(crate) async fn api_call(
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
         // 1. Resolve and execute WASM locally (fast)
         let source = if let Some(ref url) = wasm_url_hint {
-            ParsedSource::WasmUrl { url: url.clone(), hash: String::new() }
+            ParsedSource::WasmUrl { url: url.clone(), hash: String::new(), build_target: None }
         } else {
             ParsedSource::Unknown
         };
@@ -435,11 +441,18 @@ pub(crate) async fn api_call(
             max_memory_mb: 256,
             max_execution_seconds: 60,
             source: ParsedSource::Unknown,
+            build_target: None,
         };
         let mut env = HashMap::new();
         env.insert("REQUEST_TYPE".into(), "http".into());
 
-        let wasm_result = execute_single_wasm(&wasm_bytes, 0, &input_str, &rpc_url, &env, &info);
+        // Auto-detect P1 vs P2 from wasm magic bytes
+        let detected_target = if wasm_bytes.len() > 4 && wasm_bytes[0] == 0x00 && wasm_bytes[1] == 0x61 && wasm_bytes[2] == 0x73 && wasm_bytes[3] == 0x6d {
+            Some("wasm32-wasip1")
+        } else {
+            Some("wasm32-wasip2")
+        };
+        let wasm_result = execute_single_wasm(&wasm_bytes, 0, &input_str, &rpc_url, &env, &info, detected_target);
         let elapsed = start.elapsed();
 
         // 2. Pre-warm nonce upfront, pass to background thread. No contention, no retries.

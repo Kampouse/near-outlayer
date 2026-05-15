@@ -149,7 +149,7 @@ fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option
     let filter = EnvFilter::try_new(format!(
         "inlayer={},offchainvm_worker={}", cfg.runner.log_level, cfg.runner.log_level
     )).unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let rpc_url = rpc_override.map(|s| s.to_string()).unwrap_or(cfg.rpc.url.clone());
     let storage_dir = PathBuf::from(&cfg.storage.dir);
@@ -217,13 +217,21 @@ fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option
         max_execution_seconds: cfg.runner.max_execution_seconds,
     };
 
+    // Auto-detect: try P1 first, then P2
+    let build_target = if wasm_bytes.len() > 4 && wasm_bytes[0] == 0x00 && wasm_bytes[1] == 0x61 && wasm_bytes[2] == 0x73 && wasm_bytes[3] == 0x6d {
+        // Core WASM module — try P1
+        "wasm32-wasip1"
+    } else {
+        "wasm32-wasip2"
+    };
+
     let result = rt.block_on(executor.execute(
         &wasm_bytes,
         None,
         input.as_bytes(),
         &limits,
         if env_vars.is_empty() { None } else { Some(env_vars) },
-        Some("wasm32-wasip2"),
+        Some(build_target),
         &ResponseFormat::Text,
         None,
         None,
@@ -1276,14 +1284,17 @@ fn pay_near(from: &str, to: &str, amount: &str, network: &str) -> Result<String>
         .output()
         .context("Failed to run near CLI")?;
 
+    // near-cli-rs outputs to stderr, combine both
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("near send failed: {}", stderr);
+        anyhow::bail!("near send failed: {}", combined);
     }
 
-    // Parse tx hash from output
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_tx_hash(&stdout)
+    // Parse tx hash from output (combined stdout+stderr)
+    parse_tx_hash(&combined)
 }
 
 /// Pay FT token
@@ -1314,19 +1325,23 @@ fn pay_ft(from: &str, to: &str, amount: &str, token_contract: &str, network: &st
         anyhow::bail!("near call ft_transfer_call failed: {}", stderr);
     }
 
-    // Parse tx hash from output
+    // Parse tx hash from output (combined stdout+stderr)
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_tx_hash(&stdout)
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let combined = format!("{}\n{}", stdout, stderr);
+    parse_tx_hash(&combined)
 }
 
 /// Parse transaction hash from near CLI output
 fn parse_tx_hash(output: &str) -> Result<String> {
-    // Look for "Transaction Id: <hash>" or similar patterns
     for line in output.lines() {
-        if line.contains("Transaction Id:") || line.contains("tx hash:") {
+        // Match "Transaction Id:" or "Transaction ID:" 
+        let lower = line.to_lowercase();
+        if lower.contains("transaction id:") || lower.contains("tx hash:") {
             let parts: Vec<&str> = line.split_whitespace().collect();
             for (i, part) in parts.iter().enumerate() {
-                if *part == "Id:" || *part == "hash:" {
+                let pl = part.to_lowercase();
+                if pl == "id:" || pl == "hash:" {
                     if let Some(hash) = parts.get(i + 1) {
                         return Ok(hash.trim_end_matches(',').to_string());
                     }
