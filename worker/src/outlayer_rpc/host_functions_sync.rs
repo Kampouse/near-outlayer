@@ -767,6 +767,34 @@ impl near::rpc::api::Host for RpcHostState {
             Err(e) => (String::new(), e.to_string()),
         }
     }
+
+    // ==================== HTTP Methods ====================
+
+    fn http_get(&mut self, url: String) -> (String, String) {
+        match reqwest::blocking::get(&url) {
+            Ok(resp) => match resp.text() {
+                Ok(body) => (body, String::new()),
+                Err(e) => (String::new(), format!("http-get read error: {}", e)),
+            },
+            Err(e) => (String::new(), format!("http-get error: {}", e)),
+        }
+    }
+
+    fn http_post(&mut self, url: String, body: Vec<u8>, content_type: String) -> (String, String) {
+        let client = reqwest::blocking::Client::new();
+        match client
+            .post(&url)
+            .header("Content-Type", &content_type)
+            .body(body)
+            .send()
+        {
+            Ok(resp) => match resp.text() {
+                Ok(body) => (body, String::new()),
+                Err(e) => (String::new(), format!("http-post read error: {}", e)),
+            },
+            Err(e) => (String::new(), format!("http-post error: {}", e)),
+        }
+    }
 }
 
 /// Add NEAR RPC host functions to a wasmtime component linker

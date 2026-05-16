@@ -350,12 +350,14 @@ pub async fn execute(
     }
 
     // Register outlayer:api/host via bindgen-generated typed bindings
-    // This handles all memory lifting/lowering automatically
     {
-        crate::outlayer_flat::add_outlayer_to_linker(&mut linker, |state: &mut HostState| {
+        eprintln!("[DEBUG] Adding outlayer:api/host to linker...");
+        match crate::outlayer_flat::add_outlayer_to_linker(&mut linker, |state: &mut HostState| {
             state.outlayer_state.as_mut().expect("outlayer state")
-        })?;
-        debug!("Added outlayer:api/host via bindgen (real storage + HTTP + env)");
+        }) {
+            Ok(_) => { eprintln!("[DEBUG] outlayer:api/host added successfully"); debug!("Added outlayer:api/host via bindgen (real storage + HTTP + env)"); }
+            Err(e) => { eprintln!("[DEBUG] outlayer:api/host FAILED: {}", e); tracing::error!("Failed to add outlayer:api/host to linker: {}", e); }
+        }
     }
 
     // Add NEAR RPC host functions if context has RPC proxy

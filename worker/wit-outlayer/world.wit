@@ -1,42 +1,25 @@
 package outlayer:api;
 
 interface host {
-    // View function on a smart contract
     view: func(contract-id: string, method-name: string, args-json: string) -> result<string, string>;
-    
-    // Call a contract method (signer provided by env)
     call: func(signer-key: string, receiver-id: string, method-name: string, args-json: string, deposit-yocto: string, gas: string) -> result<string, string>;
-    
-    // Transfer NEAR tokens
     transfer: func(signer-key: string, receiver-id: string, amount-yocto: string) -> result<string, string>;
-    
-    // HTTP GET request
     http-get: func(url: string) -> result<list<u8>, string>;
-    
-    // HTTP POST request  
     http-post: func(url: string, body: list<u8>, content-type: string) -> result<list<u8>, string>;
-    
-    // Storage key-value operations
     storage-set: func(key: string, value: list<u8>) -> result<_, string>;
     storage-get: func(key: string) -> result<option<list<u8>>, string>;
     storage-has: func(key: string) -> result<bool, string>;
     storage-delete: func(key: string) -> result<_, string>;
-    
-    // Atomic storage operations
-    storage-increment: func(key: string, delta: i64) -> result<i64, string>;
-    storage-decrement: func(key: string, delta: i64) -> result<i64, string>;
+    storage-increment: func(key: string, delta: s64) -> result<s64, string>;
+    storage-decrement: func(key: string, delta: s64) -> result<s64, string>;
     storage-set-if-absent: func(key: string, value: list<u8>) -> result<bool, string>;
     storage-set-if-equals: func(key: string, expected: list<u8>, new-value: list<u8>) -> result<bool, string>;
     storage-list-keys: func(prefix: string) -> result<list<string>, string>;
     storage-clear-all: func() -> result<_, string>;
-    
-    // Worker-scoped storage
     storage-set-worker: func(key: string, value: list<u8>) -> result<_, string>;
     storage-get-worker: func(key: string) -> result<option<list<u8>>, string>;
     storage-set-worker-public: func(key: string, value: list<u8>) -> result<_, string>;
     storage-get-worker-from-project: func(key: string, project: string) -> result<option<list<u8>>, string>;
-    
-    // Environment info
     env-signer: func() -> string;
     env-predecessor: func() -> string;
 }
