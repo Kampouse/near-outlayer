@@ -588,20 +588,67 @@ pub async fn execute(
 
     // Instantiate and execute component
     debug!("Instantiating component");
-    let command = Command::instantiate_async(&mut store, &component, &linker)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to instantiate component: {}", e);
-            tracing::error!("Error details: {:?}", e);
-            e
-        })
-        .context("Failed to instantiate component")?;
-
-    debug!("Running wasi:cli/run");
-    let execution_result = command
-        .wasi_cli_run()
-        .call_run(&mut store)
-        .await;
+    let execution_result = match Command::instantiate_async(&mut store, &component, &linker).await {
+        Ok(command) => {
+            debug!("Running wasi:cli/run");
+            command.wasi_cli_run().call_run(&mut store).await
+        }
+        Err(e) => {
+            // Fallback: try raw _start export (for components without wasi:cli/run)
+            debug!("wasi:cli/run not found, trying raw _start export: {}", e);
+            let instance = linker.instantiate_async(&mut store, &component).await
+                .map_err(|e2| anyhow::anyhow!("Failed to instantiate component (fallback): {} / {}", e, e2))?;
+            // Fallback: try to find any exported function and call it
+            debug!("wasi:cli/run not found, trying any exported function: {}", e);
+            let instance = linker.instantiate_async(&mut store, &component).await
+                .map_err(|e2| anyhow::anyhow!("Failed to instantiate component (fallback): {} / {}", e, e2))?;
+            
+            // Try known names
+            let func = instance.get_func(&mut store, "run")
+                .or_else(|| instance.get_func(&mut store, "_start"));
+            
+            match func {
+                Some(f) => {
+                    debug!("Found exported function, calling it");
+                    f.call_async(&mut store, &[], &mut []).await
+                        .map(|_| Ok(()))
+                }
+                None => {
+                    // Component exports are namespaced. Try to find via exported interfaces.
+                    // Use wasmtime's resource API to enumerate
+                    debug!("No bare run/_start export. Trying to call via exported interface...");
+                    // The component exports lisp:http-get/run-export@0.1.0 with a "run" function
+                    // We need to access it via the component instance's exported instances
+                    // wasmtime 28 doesn't have a convenient API for this, so let's try
+                    // instantiating with a different approach
+                    
+                    // Actually, let's just check if the component root has any functions
+                    // by trying common patterns
+                    let names = ["run", "_start", "lisp:http-get/run-export@0.1.0#run"];
+                    let mut found = None;
+                    for name in &names {
+                        if let Some(f) = instance.get_func(&mut store, name) {
+                            found = Some(f);
+                            break;
+                        }
+                    }
+                    match found {
+                        Some(f) => {
+                            debug!("Found: calling");
+                            f.call_async(&mut store, &[], &mut []).await.map(|_| Ok(()))
+                        }
+                        None => Err(anyhow::anyhow!("No callable export found in component")),
+                    }
+                }
+                Some(func) => {
+                    debug!("Running _start export");
+                    func.call_async(&mut store, &[], &mut []).await
+                        .map(|_| Ok(()))
+                }
+                None => Err(anyhow::anyhow!("No wasi:cli/run or _start export found")),
+            }
+        }
+    };
     // Stop epoch ticker
     epoch_handle.abort();
 
