@@ -733,7 +733,15 @@ pub async fn execute(
 
             // Component exited with error or trapped
             let trap_msg = match &execution_result {
-                Err(e) => Some(e.to_string()),
+                Err(e) => {
+                    let mut detail = format!("{}", e);
+                    let mut source = e.source();
+                    while let Some(s) = source {
+                        detail.push_str(&format!("\n  caused by: {}", s));
+                        source = s.source();
+                    }
+                    Some(detail)
+                },
                 _ => None,
             };
             let error_msg = if !stderr_contents.is_empty() {
