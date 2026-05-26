@@ -31,7 +31,7 @@ wasmtime::component::bindgen!({
     world: "rpc-host",
 });
 
-/// RPC Proxy client with rate limiting (uses async-compatible blocking HTTP)
+/// RPC Proxy client with rate limiting (using blocking HTTP)
 pub struct RpcProxy {
     /// HTTP client for RPC requests (blocking)
     client: reqwest::blocking::Client,
@@ -765,34 +765,6 @@ impl near::rpc::api::Host for RpcHostState {
         match self.proxy.call_method(&method, params) {
             Ok(result) => (serde_json::to_string(&result).unwrap_or_default(), String::new()),
             Err(e) => (String::new(), e.to_string()),
-        }
-    }
-
-    // ==================== HTTP Methods ====================
-
-    fn http_get(&mut self, url: String) -> (String, String) {
-        match reqwest::blocking::get(&url) {
-            Ok(resp) => match resp.text() {
-                Ok(body) => (body, String::new()),
-                Err(e) => (String::new(), format!("http-get read error: {}", e)),
-            },
-            Err(e) => (String::new(), format!("http-get error: {}", e)),
-        }
-    }
-
-    fn http_post(&mut self, url: String, body: Vec<u8>, content_type: String) -> (String, String) {
-        let client = reqwest::blocking::Client::new();
-        match client
-            .post(&url)
-            .header("Content-Type", &content_type)
-            .body(body)
-            .send()
-        {
-            Ok(resp) => match resp.text() {
-                Ok(body) => (body, String::new()),
-                Err(e) => (String::new(), format!("http-post read error: {}", e)),
-            },
-            Err(e) => (String::new(), format!("http-post error: {}", e)),
         }
     }
 }

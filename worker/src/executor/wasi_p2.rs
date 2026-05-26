@@ -20,8 +20,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tracing::debug;
 use wasmtime::component::{Component, Linker};
 use wasmtime::*;
-use wasm_encoder::ValType as WVal;
-const W: WVal = WVal::I32;
 
 /// Global WASM engine for WASI P2 components (component model)
 ///
@@ -93,8 +91,6 @@ struct HostState {
     vrf_state: Option<VrfHostState>,
     /// Wallet state (only present if wallet_id in execution request)
     wallet_state: Option<WalletHostState>,
-    /// Outlayer flat host state (for lisp-rlm P2 components using outlayer:api/host)
-    outlayer_state: Option<crate::outlayer_flat::OutlayerHostState>,
     /// Counter for timed-out HTTP requests (shared with spawned tasks)
     http_timeout_count: Arc<std::sync::atomic::AtomicU32>,
     /// Engine handle to force epoch interrupt when aborting due to HTTP abuse (Engine::clone is Arc)
@@ -277,106 +273,44 @@ pub async fn execute(
         .any(|(name, _)| name.contains("near:storage/api"));
 
     let storage_config = exec_ctx.and_then(|ctx| ctx.storage_config.as_ref());
-    let use_local_storage = has_storage_import && storage_config.is_none();
+
+    // If WASM imports storage but we don't have storage config, fail early with helpful message
+    if has_storage_import && storage_config.is_none() {
+        anyhow::bail!(
+            "WASM imports `near:storage/api` but storage is not configured.\n\
+            \n\
+            This WASM was built with the `outlayer` crate and expects persistent storage.\n\
+            \n\
+            Possible causes:\n\
+            1. WASM is running standalone (not as part of a project)\n\
+            2. Keystore is not configured (KEYSTORE_BASE_URL/KEYSTORE_AUTH_TOKEN)\n\
+            3. Project UUID is missing from execution request\n\
+            \n\
+            To fix:\n\
+            1. Run this WASM through a project (request_execution_version with project_id)\n\
+            2. Ensure keystore is properly configured in worker environment\n\
+            3. Or rebuild WASM without `outlayer` crate if you don't need storage"
+        );
+    }
 
     // Create linker with WASI and HTTP support
     let mut linker: Linker<HostState> = Linker::new(&engine);
     wasmtime_wasi::add_to_linker_async(&mut linker)?;
     wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
 
-    // Provide core module imports that the component needs:
-    // - wasi-snapshot-preview1: WASI P1 adapter module
-    // - outlayer: host function stubs
-    {
-        // Build stub outlayer core module with all 20 host functions
-        let mut outlayer_module = wasmtime::Module::new(&engine, {
-            // Create a minimal core module that exports all outlayer functions
-            let mut build = wasm_encoder::Module::new();
-            // Type section
-            let mut types = wasm_encoder::TypeSection::new();
-            types.ty().function(vec![], vec![W]); // type 0: () -> i32
-            types.ty().function(vec![W;2], vec![W]); // type 1
-            types.ty().function(vec![W;3], vec![W]); // type 2
-            types.ty().function(vec![W;4], vec![W]); // type 3
-            types.ty().function(vec![W;5], vec![W]); // type 4
-            types.ty().function(vec![W;6], vec![W]); // type 5
-            types.ty().function(vec![W;7], vec![W]); // type 6
-            types.ty().function(vec![W;8], vec![W]); // type 7
-            types.ty().function(vec![W;10], vec![W]); // type 8
-            types.ty().function(vec![W;14], vec![W]); // type 9
-            build.section(&types);
-            // Function section (all use type 0 = return 0)
-            let mut funcs = wasm_encoder::FunctionSection::new();
-            // 0 params → type 0, 2 params → type 1, etc
-            let func_types: &[u32] = &[7,9,8,4,3,4,1,1,5,2,2,5,3,7,4,0,3,4,3,6];
-            for &ty in func_types { funcs.function(ty); }
-            build.section(&funcs);
-            // Export section
-            let mut exports = wasm_encoder::ExportSection::new();
-            let names: &[&str] = &[
-                "view","call","transfer","http_get","storage_set","storage_get",
-                "storage_has","storage_delete","storage_increment","env_signer",
-                "env_predecessor","storage_decrement","storage_set_if_absent",
-                "storage_set_if_equals","storage_list_keys","storage_clear_all",
-                "storage_set_worker","storage_get_worker","storage_set_worker_public",
-                "storage_get_worker_from_project",
-            ];
-            for (i, name) in names.iter().enumerate() {
-                exports.export(name, wasm_encoder::ExportKind::Func, i as u32);
-            }
-            build.section(&exports);
-            // Code section (all return i32(0))
-            let mut code = wasm_encoder::CodeSection::new();
-            let param_counts: &[usize] = &[8,14,10,5,4,5,2,2,6,3,3,6,4,8,5,0,4,5,4,7];
-            for &n in param_counts {
-                let mut fb = wasm_encoder::Function::new(vec![]);
-                fb.instruction(&wasm_encoder::Instruction::I32Const(0));
-                fb.instruction(&wasm_encoder::Instruction::End);
-                code.function(&fb);
-            }
-            build.section(&code);
-            build.finish()
-        })?;
-        // Register core module imports via linker.root()
-        let mut root = linker.root();
-        root.module("outlayer", &outlayer_module as &wasmtime::Module)?;
-        debug!("Added outlayer core stub module to P2 linker");
-
-        // Load and register the WASI P1→P2 adapter module
-        let adapter_bytes = include_bytes!("../../wasi_adapter.wasm");
-        let adapter = wasmtime::Module::from_binary(&engine, adapter_bytes)?;
-        root.module("wasi-snapshot-preview1", &adapter as &wasmtime::Module)?;
-        debug!("Added WASI P1 adapter module to P2 linker");
-    }
-
-    // Register outlayer:api/host via bindgen-generated typed bindings
-    {
-        eprintln!("[DEBUG] Adding outlayer:api/host to linker...");
-        match crate::outlayer_flat::add_outlayer_to_linker(&mut linker, |state: &mut HostState| {
-            state.outlayer_state.as_mut().expect("outlayer state")
-        }) {
-            Ok(_) => { eprintln!("[DEBUG] outlayer:api/host added successfully"); debug!("Added outlayer:api/host via bindgen (real storage + HTTP + env)"); }
-            Err(e) => { eprintln!("[DEBUG] outlayer:api/host FAILED: {}", e); tracing::error!("Failed to add outlayer:api/host to linker: {}", e); }
-        }
-    }
-
     // Add NEAR RPC host functions if context has RPC proxy
     let rpc_state = if let Some(ctx) = exec_ctx {
         if let Some(outlayer_rpc) = &ctx.outlayer_rpc {
             debug!("Adding NEAR RPC host functions to linker");
 
-            // Create sync RPC proxy (uses reqwest::blocking — spawn_blocking to avoid tokio panic)
-            let rpc_url = outlayer_rpc.get_rpc_url().to_string();
-            let sync_proxy = tokio::task::spawn_blocking(move || {
-                crate::outlayer_rpc::host_functions_sync::RpcProxy::new(
-                    &rpc_url,
-                    100,
-                    true,
-                    None,
-                )
-            }).await
-                .context("spawn_blocking for RPC proxy failed")?
-                .context("Failed to create RPC proxy")?;
+            // Create sync RPC proxy for host functions
+            let rpc_url = outlayer_rpc.get_rpc_url();
+            let sync_proxy = crate::outlayer_rpc::host_functions_sync::RpcProxy::new(
+                rpc_url,
+                100, // max_calls
+                true, // allow_transactions
+                None, // No default signer - WASM provides signing keys
+            )?;
 
             // Add RPC host functions to linker
             crate::outlayer_rpc::add_rpc_to_linker(&mut linker, |state: &mut HostState| {
@@ -398,35 +332,20 @@ pub async fn execute(
         if let Some(storage_config) = &ctx.storage_config {
             debug!("Adding storage host functions to linker");
 
-            // Create storage client (uses reqwest::blocking internally — use spawn_blocking)
-            let config_clone = storage_config.clone();
-            let storage_client = tokio::task::spawn_blocking(move || {
-                StorageClient::new(config_clone)
-            }).await
-                .context("spawn_blocking failed")?
+            // Create storage client
+            let storage_client = StorageClient::new(storage_config.clone())
                 .context("Failed to create storage client")?;
 
+            // Add storage host functions to linker
             add_storage_to_linker(&mut linker, |state: &mut HostState| {
                 state.storage_state_mut()
             })?;
 
             Some(StorageHostState::from_client(storage_client))
-        } else if use_local_storage {
-            debug!("Adding local-only storage host functions (no remote coordinator)");
-            add_storage_to_linker(&mut linker, |state: &mut HostState| {
-                state.storage_state_mut()
-            })?;
-            Some(StorageHostState::local_only()?)
         } else {
             debug!("No storage config in execution context");
             None
         }
-    } else if use_local_storage {
-        debug!("Adding local-only storage host functions (no execution context)");
-        add_storage_to_linker(&mut linker, |state: &mut HostState| {
-            state.storage_state_mut()
-        })?;
-        Some(StorageHostState::local_only()?)
     } else {
         None
     };
@@ -562,7 +481,6 @@ pub async fn execute(
         payment_state,
         vrf_state,
         wallet_state,
-        outlayer_state: Some(crate::outlayer_flat::OutlayerHostState::new()),
         http_timeout_count: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         engine_handle: engine,
     };
@@ -588,67 +506,20 @@ pub async fn execute(
 
     // Instantiate and execute component
     debug!("Instantiating component");
-    let execution_result = match Command::instantiate_async(&mut store, &component, &linker).await {
-        Ok(command) => {
-            debug!("Running wasi:cli/run");
-            command.wasi_cli_run().call_run(&mut store).await
-        }
-        Err(e) => {
-            // Fallback: try raw _start export (for components without wasi:cli/run)
-            debug!("wasi:cli/run not found, trying raw _start export: {}", e);
-            let instance = linker.instantiate_async(&mut store, &component).await
-                .map_err(|e2| anyhow::anyhow!("Failed to instantiate component (fallback): {} / {}", e, e2))?;
-            // Fallback: try to find any exported function and call it
-            debug!("wasi:cli/run not found, trying any exported function: {}", e);
-            let instance = linker.instantiate_async(&mut store, &component).await
-                .map_err(|e2| anyhow::anyhow!("Failed to instantiate component (fallback): {} / {}", e, e2))?;
-            
-            // Try known names
-            let func = instance.get_func(&mut store, "run")
-                .or_else(|| instance.get_func(&mut store, "_start"));
-            
-            match func {
-                Some(f) => {
-                    debug!("Found exported function, calling it");
-                    f.call_async(&mut store, &[], &mut []).await
-                        .map(|_| Ok(()))
-                }
-                None => {
-                    // Component exports are namespaced. Try to find via exported interfaces.
-                    // Use wasmtime's resource API to enumerate
-                    debug!("No bare run/_start export. Trying to call via exported interface...");
-                    // The component exports lisp:http-get/run-export@0.1.0 with a "run" function
-                    // We need to access it via the component instance's exported instances
-                    // wasmtime 28 doesn't have a convenient API for this, so let's try
-                    // instantiating with a different approach
-                    
-                    // Actually, let's just check if the component root has any functions
-                    // by trying common patterns
-                    let names = ["run", "_start", "lisp:http-get/run-export@0.1.0#run"];
-                    let mut found = None;
-                    for name in &names {
-                        if let Some(f) = instance.get_func(&mut store, name) {
-                            found = Some(f);
-                            break;
-                        }
-                    }
-                    match found {
-                        Some(f) => {
-                            debug!("Found: calling");
-                            f.call_async(&mut store, &[], &mut []).await.map(|_| Ok(()))
-                        }
-                        None => Err(anyhow::anyhow!("No callable export found in component")),
-                    }
-                }
-                Some(func) => {
-                    debug!("Running _start export");
-                    func.call_async(&mut store, &[], &mut []).await
-                        .map(|_| Ok(()))
-                }
-                None => Err(anyhow::anyhow!("No wasi:cli/run or _start export found")),
-            }
-        }
-    };
+    let command = Command::instantiate_async(&mut store, &component, &linker)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to instantiate component: {}", e);
+            tracing::error!("Error details: {:?}", e);
+            e
+        })
+        .context("Failed to instantiate component")?;
+
+    debug!("Running wasi:cli/run");
+    let execution_result = command
+        .wasi_cli_run()
+        .call_run(&mut store)
+        .await;
     // Stop epoch ticker
     epoch_handle.abort();
 
@@ -700,19 +571,6 @@ pub async fn execute(
             Ok((output, fuel_consumed, refund_usd))
         }
         Ok(Err(_)) | Err(_) => {
-            // Check for normal WASI exit (proc_exit(0))
-            match &execution_result {
-                Err(e) => {
-                    if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
-                        if exit.0 == 0 {
-                            let output = stdout_pipe.contents().to_vec();
-                            debug!("Component exited normally (I32Exit(0)), output: {} bytes", output.len());
-                            return Ok((output, fuel_consumed, refund_usd));
-                        }
-                    }
-                }
-                _ => {}
-            }
             // Check if this was an epoch interruption (timeout)
             let err_ref = match &execution_result {
                 Err(e) => Some(e),
@@ -733,15 +591,7 @@ pub async fn execute(
 
             // Component exited with error or trapped
             let trap_msg = match &execution_result {
-                Err(e) => {
-                    let mut detail = format!("{}", e);
-                    let mut source = e.source();
-                    while let Some(s) = source {
-                        detail.push_str(&format!("\n  caused by: {}", s));
-                        source = s.source();
-                    }
-                    Some(detail)
-                },
+                Err(e) => Some(e.to_string()),
                 _ => None,
             };
             let error_msg = if !stderr_contents.is_empty() {

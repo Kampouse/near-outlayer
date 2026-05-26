@@ -10,7 +10,6 @@ pub mod collateral_fetcher;
 pub mod fastfs;
 pub mod outlayer_rpc;
 pub mod outlayer_storage;
-pub mod outlayer_flat;
 pub mod outlayer_payment;
 pub mod outlayer_vrf;
 pub mod outlayer_wallet;
