@@ -121,14 +121,15 @@ impl near::storage::api::Host for StorageHostState {
 
     fn get(&mut self, key: String) -> (Vec<u8>, String) {
         debug!("storage::get key={}", key);
-        match self.client.get(&key) {
+        let result = match self.client.get(&key) {
             Ok(Some(value)) => (value, String::new()),
             Ok(None) => (Vec::new(), String::new()),
             Err(e) => {
                 debug!("storage::get remote failed ({}), using local fallback", e);
                 self.local_get(&key)
             }
-        }
+        };
+        result
     }
 
     fn has(&mut self, key: String) -> bool {

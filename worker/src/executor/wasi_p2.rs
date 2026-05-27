@@ -504,16 +504,23 @@ pub async fn execute(
         }
     });
 
-    // Instantiate and execute component
+    // Instantiate component manually to get memory reference
     debug!("Instantiating component");
-    let command = Command::instantiate_async(&mut store, &component, &linker)
+    let instance = linker.instantiate_async(&mut store, &component)
         .await
         .map_err(|e| {
             tracing::error!("Failed to instantiate component: {}", e);
-            tracing::error!("Error details: {:?}", e);
             e
         })
         .context("Failed to instantiate component")?;
+
+    // Wrap in Command for wasi:cli/run
+    let command = Command::new(&mut store, &instance)
+        .context("Failed to create Command from instance")?;
+
+    // Save the core memory reference for post-execution debug dump
+    // In wasmtime 28, Command wraps an Instance. We need to find the memory export.
+    // The linker creates the instance; let's just grab memory from the store after execution.
 
     debug!("Running wasi:cli/run");
     let execution_result = command
@@ -526,6 +533,12 @@ pub async fn execute(
     // Get fuel consumed before checking result
     let fuel_consumed = limits.max_instructions - store.get_fuel().unwrap_or(0);
     debug!("Component consumed {} instructions", fuel_consumed);
+
+    // ── DEBUG: Dump cabi_realloc trace buffer ──
+    // NOTE: wasmtime 28 component Instance doesn't expose get_memory directly.
+    // Memory is accessible via the Store after instantiation.
+    // For now, we rely on the eprintln! in the host functions.
+    eprintln!("DEBUG: post-execution fuel consumed = {}", fuel_consumed);
 
     // Log RPC call count if available
     if let Some(ref rpc_state) = store.data().rpc_state {
