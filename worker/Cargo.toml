@@ -100,3 +100,6 @@ tempfile = "3.10"
 
 # Signal handling
 ctrlc = "3"
+
+[patch.crates-io]
+wasmtime-wasi = { path = "../vendor/wasmtime-wasi" }
