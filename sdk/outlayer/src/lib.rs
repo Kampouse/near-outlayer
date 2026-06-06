@@ -60,6 +60,7 @@ wit_bindgen::generate!({
     with: {
         "near:storage/api@0.1.0": generate,
         "near:vrf/api@0.1.0": generate,
+        "near:rpc/api@0.1.0": generate,
     },
 });
 

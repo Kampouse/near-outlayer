@@ -31,6 +31,37 @@ wasmtime::component::bindgen!({
     world: "rpc-host",
 });
 
+/// SSRF protection: block internal/private IPs
+fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            // Loopback: 127.0.0.0/8
+            if octets[0] == 127 { return true; }
+            // Private: 10.0.0.0/8
+            if octets[0] == 10 { return true; }
+            // Private: 172.16.0.0/12
+            if octets[0] == 172 && (octets[1] & 0xf0) == 16 { return true; }
+            // Private: 192.168.0.0/16
+            if octets[0] == 192 && octets[1] == 168 { return true; }
+            // Link-local: 169.254.0.0/16
+            if octets[0] == 169 && octets[1] == 254 { return true; }
+            // Broadcast: 255.255.255.255
+            if octets == [255, 255, 255, 255] { return true; }
+            false
+        }
+        std::net::IpAddr::V6(v6) => {
+            // Loopback: ::1
+            if v6.is_loopback() { return true; }
+            // IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1) — recurse on the inner v4
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(std::net::IpAddr::V4(v4));
+            }
+            false
+        }
+    }
+}
+
 /// RPC Proxy client with rate limiting (uses async-compatible blocking HTTP)
 pub struct RpcProxy {
     /// HTTP client for RPC requests (blocking)
@@ -103,6 +134,123 @@ impl RpcProxy {
         } else {
             url.to_string()
         }
+    }
+
+    /// SSRF protection: validate URL and resolve DNS to block internal IPs
+    fn validate_url(&self, url: &str) -> Result<()> {
+        let parsed = reqwest::Url::parse(url)
+            .with_context(|| format!("Invalid URL: {}", url))?;
+
+        match parsed.scheme() {
+            "https" | "http" => {}
+            scheme => anyhow::bail!("Unsupported URL scheme: {}. Only http and https allowed.", scheme),
+        }
+
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("URL has no host"))?;
+
+        let port = parsed.port().unwrap_or(match parsed.scheme() {
+            "https" => 443,
+            "http" => 80,
+            _ => 80,
+        });
+
+        let addrs: Vec<std::net::SocketAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(host, port))
+            .with_context(|| format!("DNS resolution failed for {}:{}", host, port))?
+            .collect();
+
+        if addrs.is_empty() {
+            anyhow::bail!("DNS resolution returned no addresses for {}:{}", host, port);
+        }
+
+        for addr in &addrs {
+            if is_blocked_ip(addr.ip()) {
+                anyhow::bail!("URL {} resolves to blocked IP {}. SSRF protection triggered.", host, addr.ip());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Parse a JSON object string like `{"Authorization": "Bearer x", "Accept": "text/plain"}`
+    /// into a list of (name, value) header pairs. Returns empty vec on parse failure (non-fatal).
+    fn parse_headers_json(headers_json: Option<&str>) -> Vec<(String, String)> {
+        let Some(json_str) = headers_json else {
+            return vec![];
+        };
+        let Ok(val) = serde_json::from_str::<Value>(json_str) else {
+            return vec![];
+        };
+        let Some(obj) = val.as_object() else {
+            return vec![];
+        };
+        let mut headers = vec![];
+        for (key, v) in obj {
+            if let Some(s) = v.as_str() {
+                if reqwest::header::HeaderName::from_bytes(key.as_bytes()).is_ok()
+                    && reqwest::header::HeaderValue::from_str(s).is_ok()
+                {
+                    headers.push((key.clone(), s.to_string()));
+                }
+            }
+        }
+        headers
+    }
+
+    /// HTTP GET request (blocking, with SSRF protection)
+    /// Returns body as string on success
+    pub fn http_get(&self, url: &str, headers_json: Option<&str>) -> Result<String> {
+        self.check_rate_limit()?;
+        self.validate_url(url)?;
+
+        let headers = Self::parse_headers_json(headers_json);
+        info!("[RPC] HTTP GET {}", Self::safe_url_display(url));
+
+        let mut req = self.client.get(url);
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        let response = req.send().context("Failed to send HTTP GET request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().unwrap_or_default();
+            anyhow::bail!("HTTP GET {}: {}", status, error_text);
+        }
+
+        response.text().context("Failed to read HTTP response body")
+    }
+
+    /// HTTP POST request (blocking, with SSRF protection)
+    /// Content-Type defaults to application/json; override via headers if needed.
+    /// Returns body as string on success
+    pub fn http_post(&self, url: &str, body: &str, headers_json: Option<&str>) -> Result<String> {
+        self.check_rate_limit()?;
+        self.validate_url(url)?;
+
+        let headers = Self::parse_headers_json(headers_json);
+        info!("[RPC] HTTP POST {} ({} bytes)", Self::safe_url_display(url), body.len());
+
+        let mut req = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json");
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        let response = req
+            .body(body.to_string())
+            .send()
+            .context("Failed to send HTTP POST request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response.text().unwrap_or_default();
+            anyhow::bail!("HTTP POST {}: {}", status, error_text);
+        }
+
+        response.text().context("Failed to read HTTP response body")
     }
 
     /// Send JSON-RPC request (blocking)
@@ -768,31 +916,19 @@ impl near::rpc::api::Host for RpcHostState {
         }
     }
 
-    // ==================== HTTP Methods ====================
+    // ==================== HTTP API ====================
 
-    fn http_get(&mut self, url: String) -> (String, String) {
-        match reqwest::blocking::get(&url) {
-            Ok(resp) => match resp.text() {
-                Ok(body) => (body, String::new()),
-                Err(e) => (String::new(), format!("http-get read error: {}", e)),
-            },
-            Err(e) => (String::new(), format!("http-get error: {}", e)),
+    fn http_get(&mut self, url: String, headers: Option<String>) -> (String, String) {
+        match self.proxy.http_get(&url, headers.as_deref()) {
+            Ok(result) => (result, String::new()),
+            Err(e) => (String::new(), e.to_string()),
         }
     }
 
-    fn http_post(&mut self, url: String, body: Vec<u8>, content_type: String) -> (String, String) {
-        let client = reqwest::blocking::Client::new();
-        match client
-            .post(&url)
-            .header("Content-Type", &content_type)
-            .body(body)
-            .send()
-        {
-            Ok(resp) => match resp.text() {
-                Ok(body) => (body, String::new()),
-                Err(e) => (String::new(), format!("http-post read error: {}", e)),
-            },
-            Err(e) => (String::new(), format!("http-post error: {}", e)),
+    fn http_post(&mut self, url: String, body: String, headers: Option<String>) -> (String, String) {
+        match self.proxy.http_post(&url, &body, headers.as_deref()) {
+            Ok(result) => (result, String::new()),
+            Err(e) => (String::new(), e.to_string()),
         }
     }
 }

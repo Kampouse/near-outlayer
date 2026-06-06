@@ -96,17 +96,16 @@ interface api {
 
     // ==================== HTTP Methods ====================
 
-    /// HTTP GET request
-    /// url: full URL to fetch
-    /// Returns (body, error) - body is UTF-8 string on success
-    http-get: func(url: string) -> tuple<string, string>;
+    /// HTTP GET request (blocking, with SSRF protection)
+    /// Returns (body, error) - error is empty string on success
+    /// headers: optional JSON object of extra headers, e.g. {"Authorization": "Bearer ..."}
+    http-get: func(url: string, headers: option<string>) -> tuple<string, string>;
 
-    /// HTTP POST request
-    /// url: full URL to post to
-    /// body: request body as bytes
-    /// content-type: MIME type (e.g. "application/json")
-    /// Returns (body, error) - body is UTF-8 string on success
-    http-post: func(url: string, body: list<u8>, content-type: string) -> tuple<string, string>;
+    /// HTTP POST request with body and optional headers (blocking, with SSRF protection)
+    /// Returns (body, error) - error is empty string on success
+    /// Content-Type defaults to application/json; override via headers if needed
+    /// headers: optional JSON object of extra headers, e.g. {"Authorization": "Bearer ..."}
+    http-post: func(url: string, body: string, headers: option<string>) -> tuple<string, string>;
 }
 
 world rpc-host {

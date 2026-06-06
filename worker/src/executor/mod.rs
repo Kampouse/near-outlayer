@@ -226,8 +226,7 @@ impl Executor {
                         Some(ExecutionOutput::Bytes(output_bytes))
                     }
                     ResponseFormat::Text => {
-                        let text = String::from_utf8(output_bytes)
-                            .unwrap_or_else(|e| format!("Invalid UTF-8 output: {}", e));
+                        let text = String::from_utf8_lossy(&output_bytes).to_string();
                         Some(ExecutionOutput::Text(text))
                     }
                     ResponseFormat::Json => {
