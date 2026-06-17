@@ -72,7 +72,7 @@ use crate::outlayer_wallet::{WalletHostState, add_wallet_to_linker};
 use super::ExecutionContext;
 
 /// Max time for a single outbound HTTP request from WASI (seconds)
-const HTTP_REQUEST_TIMEOUT_SECS: u64 = 30;
+const HTTP_REQUEST_TIMEOUT_SECS: u64 = 120;
 /// After this many timed-out HTTP requests, WASI execution is aborted
 const HTTP_TIMEOUT_ABORT_THRESHOLD: u32 = 2;
 

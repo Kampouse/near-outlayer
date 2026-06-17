@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context as AnyhowContext, Result};
@@ -257,6 +258,143 @@ fn cmd_run(config_dir: &Path, wasm_name: &str, input: &str, rpc_override: Option
     Ok(())
 }
 
+fn cmd_serve(config_dir: &Path, wasm_name: &str, rpc_override: Option<&str>) -> Result<()> {
+    let cfg = Config::load(config_dir);
+    let wasm_path = find_wasm(wasm_name, config_dir, &cfg)?;
+
+    let filter = EnvFilter::try_new(format!(
+        "inlayer={},offchainvm_worker={}", cfg.runner.log_level, cfg.runner.log_level
+    )).unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+
+    let rpc_url = rpc_override.map(|s| s.to_string()).unwrap_or(cfg.rpc.url.clone());
+    let storage_dir = PathBuf::from(&cfg.storage.dir);
+    std::fs::create_dir_all(&storage_dir).ok();
+
+    // Set env vars from config
+    for (k, v) in &cfg.env { env::set_var(k, v); }
+    env::set_var("STORAGE_DIR", &storage_dir);
+
+    let wasm_bytes = std::fs::read(&wasm_path)
+        .with_context(|| format!("reading {}", wasm_path.display()))?;
+
+    eprintln!("🔄 Serving {} (tick every intent cycle)", wasm_path.file_name().unwrap_or_default().to_string_lossy());
+    eprintln!("   RPC: {}", rpc_url);
+    eprintln!("   Storage: {} ({})", cfg.storage.mode, cfg.storage.dir);
+    eprintln!("   Press Ctrl+C to stop");
+    eprintln!();
+
+    // Create RPC proxy and storage config in blocking thread
+    let rpc_owned = rpc_url.clone();
+    let (proxy, storage_config) = std::thread::scope(|s| {
+        s.spawn(|| -> Result<(RpcProxy, StorageConfig)> {
+            let rpc_cfg = RpcProxyConfig {
+                enabled: true,
+                rpc_url: Some(rpc_owned.clone()),
+                max_calls_per_execution: 100,
+                allow_transactions: true,
+            };
+            let proxy = RpcProxy::new(rpc_cfg, &rpc_owned)?;
+            let storage_config = StorageConfig {
+                coordinator_url: "http://127.0.0.1:9999".into(),
+                coordinator_token: "local".into(),
+                keystore_url: "http://127.0.0.1:9998".into(),
+                keystore_token: "local".into(),
+                project_uuid: "local-test".into(),
+                wasm_hash: "00000000".into(),
+                account_id: cfg_env("TEE_SIGNER_ID", "test.testnet"),
+                tee_mode: "local".into(),
+                keystore_tee_session_id: None,
+            };
+            Ok((proxy, storage_config))
+        }).join().unwrap()
+    })?;
+
+    // Pass env vars from config to WASM
+    let env_vars: HashMap<String, String> = cfg.env.clone();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    let handle = rt.handle().clone();
+
+    let exec_ctx = ExecutionContext {
+        outlayer_rpc: Some(Arc::new(proxy)),
+        storage_config: Some(storage_config),
+        runtime_handle: handle,
+        compiled_cache: None,
+        vrf_config: None,
+        wallet_config: None,
+    };
+
+    let executor = Executor::new(100_000_000_000u64, true).with_context(exec_ctx);
+
+    let limits = ResourceLimits {
+        max_instructions: 100_000_000_000u64,
+        max_memory_mb: cfg.runner.max_memory_mb,
+        max_execution_seconds: 86400000u64, // 1000 days = unlimited
+    };
+
+    // Auto-detect build target
+    let build_target = if wasm_bytes.len() > 4 && wasm_bytes[0] == 0x00 && wasm_bytes[1] == 0x61 && wasm_bytes[2] == 0x73 && wasm_bytes[3] == 0x6d && wasm_bytes[4] == 0x01 {
+        "wasm32-wasip1"
+    } else {
+        "wasm32-wasip2"
+    };
+
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("\n⛔ Ctrl+C received, stopping...");
+        r.store(false, Ordering::SeqCst);
+    }).map_err(|e| anyhow::anyhow!("Failed to set Ctrl+C handler: {}", e))?;
+
+    let mut cycle = 0u64;
+    while running.load(Ordering::SeqCst) {
+        cycle += 1;
+        eprintln!("--- cycle {} ---", cycle);
+
+        let result = match rt.block_on(executor.execute(
+            &wasm_bytes,
+            None,
+            "".as_bytes(),
+            &limits,
+            if env_vars.is_empty() { None } else { Some(env_vars.clone()) },
+            Some(build_target),
+            &ResponseFormat::Text,
+            None,
+            None,
+            None,
+        )) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("❌ Execution error: {}", e);
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue;
+            }
+        };
+
+        if let Some(output) = &result.output {
+            let s = match output {
+                ExecutionOutput::Text(t) => t.clone(),
+                ExecutionOutput::Json(j) => serde_json::to_string_pretty(j).unwrap_or_default(),
+                ExecutionOutput::Bytes(b) => format!("{} bytes", b.len()),
+            };
+            println!("📤 Output: {}", s);
+        }
+        if let Some(error) = &result.error {
+            eprintln!("❌ Error: {}", error);
+        }
+
+        // Brief pause between cycles
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    eprintln!("Stopped after {} cycles.", cycle);
+
+    drop(executor);
+    drop(rt);
+    Ok(())
+}
+
 /// Get env var with fallback, checking config env first
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -334,7 +472,7 @@ fn cmd_submit(extra_args: &[String]) -> Result<()> {
         "resource_limits": {
             "max_instructions": 500_000_000_000u64,
             "max_memory_mb": 256u32,
-            "max_execution_seconds": 60u64
+            "max_execution_seconds": 180u64
         },
         "input_data": input_b64
     });
@@ -1583,8 +1721,9 @@ Usage:\n\
   inlayer register <project-name> <source>    Register project on contract\n\
                                              Sources: --github <repo> <commit> | --wasm-url <url> <sha256>\n\
   inlayer projects [--account <id>]           List registered projects\n\
-  inlayer run <wasm> <input> [--rpc <url>]    Run WASM locally\n\
-  inlayer submit <input> [--wasm-url <url>]   Submit request to contract\n\
+  inlayer run <wasm> <input> [--rpc <url>]    Run WASM locally\\n\
+  inlayer serve <wasm> [--rpc <url>]         Serve WASM continuously (unlimited timeout)\\n\
+  inlayer submit <input> [--wasm-url <url>]   Submit request to contract\\n\
   inlayer status [--contract <id>]            Check pending requests\n\
   inlayer list                                List available WASMs\n\
   inlayer config                              Show current config\n\
@@ -1650,6 +1789,23 @@ Environment Variables:\n\
                 }
             }
             cmd_run(&config_dir, wasm, &input, rpc_override.as_deref())?;
+        }
+        "serve" => {
+            if args.len() < 3 {
+                eprintln!("Usage: inlayer serve <wasm> [--rpc <url>]");
+                std::process::exit(1);
+            }
+            let wasm = &args[2];
+            let mut rpc_override: Option<String> = None;
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "--rpc" && i + 1 < args.len() {
+                    rpc_override = Some(args[i + 1].clone()); i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            cmd_serve(&config_dir, wasm, rpc_override.as_deref())?;
         }
         "submit" => {
             cmd_submit(&args[2..])?;

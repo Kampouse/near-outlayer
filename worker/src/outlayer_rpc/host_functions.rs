@@ -341,8 +341,19 @@ pub fn add_rpc_to_linker<T: Send + 'static>(
     interface.func_wrap_async(
         "call",
         move |mut caller: wasmtime::StoreContextMut<'_, T>,
-              (signer_id, signer_key, receiver_id, method_name, args_json, deposit_yocto, gas): (String, String, String, String, String, String, String)| {
+              (signer_id, signer_key, receiver_id, method_name, args_json, deposit_yocto, gas, wait_until): (String, String, String, String, String, String, String, String)| {
             Box::new(async move {
+                eprintln!("[HOST] ====== CALL PARAMS ======");
+                eprintln!("[HOST]   signer_id   = {:?}", signer_id);
+                eprintln!("[HOST]   signer_key  = {:?}...", &signer_key.get(0..20).unwrap_or(&signer_key));
+                eprintln!("[HOST]   receiver_id = {:?}", receiver_id);
+                eprintln!("[HOST]   method      = {:?}", method_name);
+                eprintln!("[HOST]   args        = {:?}", args_json);
+                eprintln!("[HOST]   deposit     = {:?}", deposit_yocto);
+                eprintln!("[HOST]   gas         = {:?}", gas);
+                eprintln!("[HOST]   wait        = {:?}", wait_until);
+                use std::io::Write;
+                std::io::stderr().flush().ok();
                 let state = get_state(caller.data_mut());
                 let proxy = state.proxy.clone();
                 let runtime = state.runtime.clone();
@@ -377,7 +388,7 @@ pub fn add_rpc_to_linker<T: Send + 'static>(
     interface.func_wrap_async(
         "transfer",
         move |mut caller: wasmtime::StoreContextMut<'_, T>,
-              (signer_id, signer_key, receiver_id, amount_yocto): (String, String, String, String)| {
+              (signer_id, signer_key, receiver_id, amount_yocto, wait_until): (String, String, String, String, String)| {
             Box::new(async move {
                 let state = get_state(caller.data_mut());
                 let proxy = state.proxy.clone();

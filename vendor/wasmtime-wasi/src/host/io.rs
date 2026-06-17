@@ -196,6 +196,7 @@ where
     ) -> StreamResult<Vec<u8>> {
         let len = len.try_into().unwrap_or(usize::MAX);
         let bytes = self.table().get_mut(&stream)?.blocking_read(len).await?;
+        eprintln!("[DEBUG] blocking_read: requested={}, actual={}, first_10_bytes={:02x?}", len, bytes.len(), &bytes[..bytes.len().min(10)]);
         debug_assert!(bytes.len() <= len);
         Ok(bytes.into())
     }

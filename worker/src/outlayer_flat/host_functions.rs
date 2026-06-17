@@ -297,6 +297,12 @@ impl outlayer::api::host::Host for OutlayerHostState {
         debug!("[env-get] {} = {:?}", key, result);
         result
     }
+
+    fn sleep_ms(&mut self, ms: u32) -> Result<(), String> {
+        debug!("[sleep-ms] {}", ms);
+        std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+        Ok(())
+    }
 }
 
 /// Add outlayer host functions to a wasmtime component linker

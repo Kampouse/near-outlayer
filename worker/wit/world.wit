@@ -96,6 +96,16 @@ interface api {
 
     // ==================== HTTP Methods ====================
 
+    /// Read an environment variable value
+    /// Returns the value string, or empty string if not found
+    env-var: func(name: string) -> string;
+
+    /// Sign a message with ed25519 private key
+    /// secret-key: 64 bytes of ed25519 secret key (raw, NOT the "ed25519:..." NEAR format)
+    /// message: arbitrary bytes to sign
+    /// Returns 64-byte signature as base64 string, or empty string on error
+    ed25519-sign: func(secret-key: string, message: string) -> string;
+
     /// HTTP GET request (blocking, with SSRF protection)
     /// Returns (body, error) - error is empty string on success
     /// headers: optional JSON object of extra headers, e.g. {"Authorization": "Bearer ..."}
