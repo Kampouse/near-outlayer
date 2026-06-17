@@ -154,6 +154,22 @@ impl WasiHttpView for HostState {
         let url = request.uri().to_string();
         let timeout_duration = std::time::Duration::from_secs(HTTP_REQUEST_TIMEOUT_SECS);
 
+        // Auto-inject auth headers for AI APIs from environment
+        let request = if url.contains("api.z.ai") || url.contains("openai.com") || url.contains("anthropic.com") {
+            if let Ok(key) = std::env::var("GLM_API_KEY") {
+                let (mut parts, body) = request.into_parts();
+                parts.headers.insert(
+                    hyper::header::AUTHORIZATION,
+                    hyper::header::HeaderValue::from_str(&format!("Bearer {}", key)).unwrap()
+                );
+                hyper::Request::from_parts(parts, body)
+            } else {
+                request
+            }
+        } else {
+            request
+        };
+
         let handle = wasmtime_wasi::runtime::spawn(async move {
             match tokio::time::timeout(
                 timeout_duration,
@@ -308,7 +324,7 @@ pub async fn execute(
             // Function section (all use type 0 = return 0)
             let mut funcs = wasm_encoder::FunctionSection::new();
             // 0 params → type 0, 2 params → type 1, etc
-            let func_types: &[u32] = &[7,9,8,4,3,4,1,1,5,2,2,5,3,7,4,0,3,4,3,6];
+            let func_types: &[u32] = &[7,9,8,4,3,4,1,1,5,2,2,5,3,7,4,0,3,4,3,6,4];
             for &ty in func_types { funcs.function(ty); }
             build.section(&funcs);
             // Export section
@@ -320,6 +336,7 @@ pub async fn execute(
                 "storage_set_if_equals","storage_list_keys","storage_clear_all",
                 "storage_set_worker","storage_get_worker","storage_set_worker_public",
                 "storage_get_worker_from_project",
+                "env_get",
             ];
             for (i, name) in names.iter().enumerate() {
                 exports.export(name, wasm_encoder::ExportKind::Func, i as u32);
@@ -327,7 +344,7 @@ pub async fn execute(
             build.section(&exports);
             // Code section (all return i32(0))
             let mut code = wasm_encoder::CodeSection::new();
-            let param_counts: &[usize] = &[8,14,10,5,4,5,2,2,6,3,3,6,4,8,5,0,4,5,4,7];
+            let param_counts: &[usize] = &[8,14,10,5,4,5,2,2,6,3,3,6,4,8,5,0,4,5,4,7,4];
             for &n in param_counts {
                 let mut fb = wasm_encoder::Function::new(vec![]);
                 fb.instruction(&wasm_encoder::Instruction::I32Const(0));
@@ -361,9 +378,12 @@ pub async fn execute(
     }
 
     // Add NEAR RPC host functions if context has RPC proxy
+    eprintln!("[DEBUG] exec_ctx is: {:?}", if exec_ctx.is_some() { "Some" } else { "None" });
     let rpc_state = if let Some(ctx) = exec_ctx {
+        eprintln!("[DEBUG] ctx.outlayer_rpc is: {:?}", if ctx.outlayer_rpc.is_some() { "Some" } else { "None" });
         if let Some(outlayer_rpc) = &ctx.outlayer_rpc {
             debug!("Adding NEAR RPC host functions to linker");
+            eprintln!("[DEBUG] Adding NEAR RPC host functions to linker");
 
             // Create sync RPC proxy (uses reqwest::blocking — spawn_blocking to avoid tokio panic)
             let rpc_url = outlayer_rpc.get_rpc_url().to_string();

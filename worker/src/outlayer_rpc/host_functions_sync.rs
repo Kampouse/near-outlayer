@@ -63,9 +63,10 @@ fn is_blocked_ip(ip: std::net::IpAddr) -> bool {
 }
 
 /// RPC Proxy client with rate limiting (uses async-compatible blocking HTTP)
+#[derive(Clone)]
 pub struct RpcProxy {
     /// HTTP client for RPC requests (blocking)
-    client: reqwest::blocking::Client,
+    client: Arc<reqwest::blocking::Client>,
     /// RPC URL
     rpc_url: String,
     /// Maximum calls per execution
@@ -93,7 +94,7 @@ impl RpcProxy {
             .context("Failed to create HTTP client")?;
 
         Ok(Self {
-            client,
+            client: Arc::new(client),
             rpc_url: rpc_url.to_string(),
             max_calls,
             allow_transactions,
@@ -238,6 +239,12 @@ impl RpcProxy {
             .header("Content-Type", "application/json");
         for (name, value) in headers {
             req = req.header(name, value);
+        }
+        // Auto-inject auth headers for AI APIs from environment
+        if url.contains("api.z.ai") || url.contains("openai.com") || url.contains("anthropic.com") {
+            if std::env::var("GLM_API_KEY").is_ok() {
+                req = req.header("Authorization", format!("Bearer {}", std::env::var("GLM_API_KEY").unwrap()));
+            }
         }
         let response = req
             .body(body.to_string())
@@ -554,23 +561,30 @@ impl near::rpc::api::Host for RpcHostState {
             params["block_id"] = bid;
         }
 
-        match self.proxy.call_method("query", params) {
-            Ok(result) => {
-                if let Some(result_array) = result.get("result").and_then(|r| r.get("result")) {
-                    if let Some(arr) = result_array.as_array() {
-                        let bytes: Vec<u8> = arr
-                            .iter()
-                            .filter_map(|v| v.as_u64().map(|n| n as u8))
-                            .collect();
-                        return (String::from_utf8_lossy(&bytes).to_string(), String::new());
+        // Clone proxy to use inside thread scope
+        let proxy = self.proxy.clone();
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                match proxy.call_method("query", params) {
+                    Ok(result) => {
+                        if let Some(result_array) = result.get("result").and_then(|r| r.get("result")) {
+                            if let Some(arr) = result_array.as_array() {
+                                let bytes: Vec<u8> = arr
+                                    .iter()
+                                    .filter_map(|v| v.as_u64().map(|n| n as u8))
+                                    .collect();
+                                return (String::from_utf8_lossy(&bytes).to_string(), String::new());
+                            }
+                        }
+                        (serde_json::to_string(&result).unwrap_or_default(), String::new())
                     }
+                    Err(e) => (String::new(), e.to_string()),
                 }
-                (serde_json::to_string(&result).unwrap_or_default(), String::new())
-            }
-            Err(e) => (String::new(), e.to_string()),
-        }
+            })
+            .join()
+            .unwrap_or_else(|_| (String::new(), "thread panicked".to_string()))
+        })
     }
-
     fn view_account(&mut self, account_id: String, finality_or_block: String) -> (String, String) {
         let (finality, block_id) = parse_finality_or_block(&finality_or_block);
 
@@ -781,6 +795,15 @@ impl near::rpc::api::Host for RpcHostState {
         gas: String,
         wait_until: String,       // NEW: wait until finality
     ) -> (String, String) {
+        eprintln!("[HOST SYNC] call() invoked:");
+        eprintln!("[HOST SYNC]   signer_id   = {:?}", signer_id);
+        eprintln!("[HOST SYNC]   signer_key  = {:?}...", &signer_key.get(0..20).unwrap_or(&signer_key));
+        eprintln!("[HOST SYNC]   receiver_id = {:?}", receiver_id);
+        eprintln!("[HOST SYNC]   method      = {:?}", method_name);
+        eprintln!("[HOST SYNC]   args        = {:?}", args_json);
+        eprintln!("[HOST SYNC]   deposit     = {:?}", deposit_yocto);
+        eprintln!("[HOST SYNC]   gas         = {:?}", gas);
+        eprintln!("[HOST SYNC]   wait        = {:?}", wait_until);
         debug!("[HOST] call() invoked: signer={}, receiver={}, method={}, deposit={}, gas={}, wait={}",
             signer_id, receiver_id, method_name, deposit_yocto, gas,
             if wait_until.is_empty() { "FINAL" } else { &wait_until });
@@ -930,6 +953,67 @@ impl near::rpc::api::Host for RpcHostState {
             Ok(result) => (result, String::new()),
             Err(e) => (String::new(), e.to_string()),
         }
+    }
+
+    // ==================== Utility Methods ====================
+
+    fn env_var(&mut self, name: String) -> String {
+        let value = std::env::var(&name).unwrap_or_default();
+        debug!("[RPC] env-var called: {} -> {:?}", name, if value.is_empty() { "EMPTY" } else { &value });
+        eprintln!("[DEBUG] env-var called: {} -> {:?}", name, if value.is_empty() { "EMPTY" } else { &value });
+        value
+    }
+
+    fn ed25519_sign(&mut self, secret_key: String, message: String) -> String {
+        use ed25519_dalek::{SigningKey, Signer};
+        use base64::Engine;
+
+        // secret_key can be raw 64 bytes or NEAR format "ed25519:base58..."
+        let sk_bytes: [u8; 32] = if let Some(stripped) = secret_key.strip_prefix("ed25519:") {
+            // NEAR format: base58-encode of the 32-byte secret key
+            match bs58::decode(stripped).into_vec() {
+                Ok(bytes) if bytes.len() == 32 => {
+                    match bytes.try_into() {
+                        Ok(arr) => arr,
+                        Err(_) => {
+                            debug!("[RPC] ed25519-sign: decoded key is not 32 bytes");
+                            return String::new();
+                        }
+                    }
+                }
+                Ok(_) => {
+                    debug!("[RPC] ed25519-sign: decoded key is not 32 bytes");
+                    return String::new();
+                }
+                Err(e) => {
+                    debug!("[RPC] ed25519-sign: invalid base58 in key: {}", e);
+                    return String::new();
+                }
+            }
+        } else if let Ok(bytes) = hex::decode(&secret_key) {
+            match bytes.try_into() {
+                Ok(arr) => arr,
+                Err(_) => {
+                    debug!("[RPC] ed25519-sign: hex key is not 32 bytes");
+                    return String::new();
+                }
+            }
+        } else {
+            // Try raw string as-is if 32 bytes
+            if secret_key.len() == 32 {
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(secret_key.as_bytes());
+                arr
+            } else {
+                debug!("[RPC] ed25519-sign: unrecognized key format");
+                return String::new();
+            }
+        };
+
+        let signing_key = SigningKey::from_bytes(&sk_bytes);
+
+        let signature = signing_key.sign(message.as_bytes());
+        base64::engine::general_purpose::STANDARD.encode(signature.to_bytes())
     }
 }
 
