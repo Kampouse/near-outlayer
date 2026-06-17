@@ -1639,6 +1639,12 @@ Environment Variables:\n\
             while i < args.len() {
                 if args[i] == "--rpc" && i + 1 < args.len() {
                     rpc_override = Some(args[i + 1].clone()); i += 2;
+                } else if args[i] == "--target" && i + 1 < args.len() {
+                    // Skip --target flag (used by executor but not needed in cmd_run)
+                    i += 2;
+                } else if args[i].starts_with("--target=") {
+                    // Skip --target=value format
+                    i += 1;
                 } else {
                     input = args[i].clone(); i += 1;
                 }
