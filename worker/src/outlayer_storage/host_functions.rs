@@ -1,15 +1,13 @@
 //! Storage host functions for WASM components
 //!
 //! Implements the `near:storage/api` WIT interface.
-//! When keystore is unavailable, falls back to local filesystem.
-//! When running locally (no coordinator URL), skips remote calls entirely.
+//! Local storage uses SQLite for persistence, atomicity, and queries.
+//! When running with a coordinator, also syncs to remote storage.
 
 use anyhow::Result;
-use std::collections::HashMap;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, info, warn};
 use wasmtime::component::Linker;
 
 use super::client::StorageClient;
@@ -23,65 +21,109 @@ wasmtime::component::bindgen!({
 /// Host state for storage functions
 pub struct StorageHostState {
     client: StorageClient,
-    /// Local filesystem fallback
-    local_dir: PathBuf,
-    local_cache: Mutex<HashMap<String, Vec<u8>>>,
+    /// SQLite database for local persistence (opened once per execution context)
+    db: Mutex<rusqlite::Connection>,
+    /// In-memory cache for hot keys (avoids SQLite roundtrip within same execution)
+    cache: Mutex<std::collections::HashMap<String, Vec<u8>>>,
 }
 
 impl StorageHostState {
     /// Create new storage host state from existing client
     pub fn from_client(client: StorageClient) -> Self {
-        let local_dir = std::env::var("STORAGE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp/outlayer-storage"));
-        fs::create_dir_all(&local_dir).ok();
-        Self { client, local_dir, local_cache: Mutex::new(HashMap::new()) }
+        let db_path = sqlite_db_path();
+        let db = open_db(&db_path);
+        Self { client, db: Mutex::new(db), cache: Mutex::new(std::collections::HashMap::new()) }
     }
 
     /// Create local-only storage (no remote coordinator — for inlayer/testing)
     pub fn local_only() -> Result<Self> {
-        let local_dir = std::env::var("STORAGE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("./storage"));
-        fs::create_dir_all(&local_dir).ok();
-        // Create with empty URL — is_local() returns true, all remote calls skipped
+        let db_path = sqlite_db_path();
+        let db = open_db(&db_path);
         let client = StorageClient::new_local()?;
-        Ok(Self { client, local_dir, local_cache: Mutex::new(HashMap::new()) })
-    }
-
-    fn safe_key(&self, key: &str) -> PathBuf {
-        let hex: String = key.bytes().map(|b| format!("{:02x}", b)).collect();
-        self.local_dir.join(hex)
+        Ok(Self { client, db: Mutex::new(db), cache: Mutex::new(std::collections::HashMap::new()) })
     }
 
     fn local_set(&mut self, key: &str, value: &[u8]) -> String {
-        let path = self.safe_key(key);
-        match fs::write(&path, value) {
-            Ok(()) => { self.local_cache.lock().unwrap().insert(key.to_string(), value.to_vec()); String::new() }
-            Err(e) => { e.to_string() }
+        let mut cache = self.cache.lock().unwrap();
+        cache.insert(key.to_string(), value.to_vec());
+        let mut db = self.db.lock().unwrap();
+        match db.execute(
+            "INSERT INTO kv (key, value, updated_at) VALUES (?1, ?2, unixepoch()) \
+             ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = unixepoch()",
+            rusqlite::params![key, value],
+        ) {
+            Ok(_) => String::new(),
+            Err(e) => {
+                warn!("SQLite set failed for key={}: {}", key, e);
+                e.to_string()
+            }
         }
     }
 
     fn local_get(&mut self, key: &str) -> (Vec<u8>, String) {
-        if let Some(cached) = self.local_cache.lock().unwrap().get(key).cloned() {
+        // Check in-memory cache first
+        if let Some(cached) = self.cache.lock().unwrap().get(key).cloned() {
             return (cached, String::new());
         }
-        let path = self.safe_key(key);
-        match fs::read(&path) {
-            Ok(data) => { self.local_cache.lock().unwrap().insert(key.to_string(), data.clone()); (data, String::new()) }
-            Err(_) => (Vec::new(), String::new()),
+        let mut db = self.db.lock().unwrap();
+        match db.query_row("SELECT value FROM kv WHERE key = ?1", rusqlite::params![key], |row| {
+            row.get::<_, Vec<u8>>(0)
+        }) {
+            Ok(data) => {
+                self.cache.lock().unwrap().insert(key.to_string(), data.clone());
+                (data, String::new())
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => (Vec::new(), String::new()),
+            Err(e) => {
+                warn!("SQLite get failed for key={}: {}", key, e);
+                (Vec::new(), e.to_string())
+            }
         }
     }
 
     fn local_has(&mut self, key: &str) -> bool {
-        if self.local_cache.lock().unwrap().contains_key(key) { return true; }
-        self.safe_key(key).exists()
+        if self.cache.lock().unwrap().contains_key(key) { return true; }
+        let mut db = self.db.lock().unwrap();
+        db.query_row("SELECT 1 FROM kv WHERE key = ?1", rusqlite::params![key], |_| Ok(()))
+            .is_ok()
     }
 
     fn local_delete(&mut self, key: &str) -> bool {
-        self.local_cache.lock().unwrap().remove(key);
-        let path = self.safe_key(key);
-        path.exists() && fs::remove_file(path).is_ok()
+        self.cache.lock().unwrap().remove(key);
+        let mut db = self.db.lock().unwrap();
+        match db.execute("DELETE FROM kv WHERE key = ?1", rusqlite::params![key]) {
+            Ok(rows) => rows > 0,
+            Err(e) => {
+                warn!("SQLite delete failed for key={}: {}", key, e);
+                false
+            }
+        }
+    }
+
+    fn local_list_keys(&mut self, prefix: &str) -> Vec<String> {
+        let mut db = self.db.lock().unwrap();
+        let mut stmt = match db.prepare("SELECT key FROM kv WHERE key LIKE ?1 || '%' ORDER BY key") {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("SQLite list_keys failed: {}", e);
+                return Vec::new();
+            }
+        };
+        let iter = match stmt.query_map(rusqlite::params![prefix], |row| row.get::<_, String>(0)) {
+            Ok(i) => i,
+            Err(e) => {
+                warn!("SQLite list_keys query failed: {}", e);
+                return Vec::new();
+            }
+        };
+        let keys: Vec<String> = iter.filter_map(|r| r.ok()).collect();
+        keys
+    }
+
+    fn local_clear_all(&mut self) {
+        self.cache.lock().unwrap().clear();
+        let mut db = self.db.lock().unwrap();
+        db.execute("DELETE FROM kv", []).ok();
     }
 }
 
@@ -131,30 +173,15 @@ impl near::storage::api::Host for StorageHostState {
     fn list_keys(&mut self, prefix: String) -> (String, String) {
         debug!("storage::list_keys prefix={}", prefix);
         if self.client.is_local() {
-            let keys: Vec<String> = fs::read_dir(&self.local_dir)
-                .ok()
-                .map(|entries| {
-                    entries.filter_map(|e| e.ok())
-                        .filter_map(|e| {
-                            let hex_str = e.file_name().to_string_lossy().to_string();
-                            // Decode hex filename back to original key string
-                            let key = (0..hex_str.len())
-                                .step_by(2)
-                                .filter_map(|i| {
-                                    u8::from_str_radix(&hex_str[i..i+2.min(hex_str.len()-i)], 16).ok()
-                                })
-                                .map(|b| b as char)
-                                .collect::<String>();
-                            if key.starts_with(&prefix) { Some(format!("\"{}\"", key)) } else { None }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            let keys: Vec<String> = self.local_list_keys(&prefix)
+                .into_iter()
+                .map(|k| format!("\"{}\"", k))
+                .collect();
             return (format!("[{}]", keys.join(",")), String::new());
         }
         let client = self.client.clone();
         let prefix_c = prefix.clone();
-        std::thread::spawn(move || client.list_keys(&prefix_c).unwrap_or_else(|_| "[]".into()))
+        std::thread::spawn(move || client.list_keys(&prefix_c).unwrap_or_else(|_| "[\"\"".into()))
             .join().map(|v| (v, String::new())).unwrap_or(("[]".into(), String::new()))
     }
 
@@ -194,9 +221,7 @@ impl near::storage::api::Host for StorageHostState {
 
     fn clear_all(&mut self) -> String {
         debug!("storage::clear_all");
-        let _ = fs::remove_dir_all(&self.local_dir);
-        fs::create_dir_all(&self.local_dir).ok();
-        self.local_cache.lock().unwrap().clear();
+        self.local_clear_all();
         if !self.client.is_local() {
             let client = self.client.clone();
             let _ = std::thread::spawn(move || { let _ = client.clear_all(); });
@@ -250,4 +275,38 @@ pub fn add_storage_to_linker<T: Send + 'static>(
     get_state: impl Fn(&mut T) -> &mut StorageHostState + Send + Sync + Copy + 'static,
 ) -> Result<()> {
     near::storage::api::add_to_linker(linker, get_state)
+}
+
+/// Determine the SQLite database path from STORAGE_DIR env var.
+/// If STORAGE_DIR ends with .db, use it directly. Otherwise, place storage.db inside it.
+fn sqlite_db_path() -> std::path::PathBuf {
+    let storage_dir = std::env::var("STORAGE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./storage"));
+    if storage_dir.extension().map_or(false, |ext| ext == "db") {
+        storage_dir
+    } else {
+        storage_dir.join("storage.db")
+    }
+}
+
+/// Open (or create) the SQLite database
+fn open_db(path: &std::path::Path) -> rusqlite::Connection {
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let conn = rusqlite::Connection::open(path)
+        .unwrap_or_else(|e| panic!("Failed to open SQLite storage at {}: {}", path.display(), e));
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;")
+        .unwrap_or_else(|e| panic!("SQLite PRAGMA failed: {}", e));
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS kv (
+            key   TEXT PRIMARY KEY,
+            value BLOB NOT NULL,
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );"
+    ).unwrap_or_else(|e| panic!("Failed to create kv table: {}", e));
+    info!("SQLite storage opened: {}", path.display());
+    conn
 }
