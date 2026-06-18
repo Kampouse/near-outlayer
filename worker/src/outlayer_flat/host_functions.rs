@@ -303,6 +303,36 @@ impl outlayer::api::host::Host for OutlayerHostState {
         std::thread::sleep(std::time::Duration::from_millis(ms as u64));
         Ok(())
     }
+
+    fn send_telegram(&mut self, chat_id: String, text: String) -> Result<String, String> {
+        let token = std::env::var("TELEGRAM_BOT_TOKEN")
+            .map_err(|_| "TELEGRAM_BOT_TOKEN not set".to_string())?;
+        let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
+        let body = serde_json::json!({"chat_id": chat_id, "text": &text});
+        debug!("[send-telegram] chat={} text_len={}", chat_id, text.len());
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let resp = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10))
+                    .build()
+                    .map_err(|e| e.to_string())?
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .map_err(|e| e.to_string())?;
+                let status = resp.status();
+                let result: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+                if status.is_success() {
+                    Ok(result.to_string())
+                } else {
+                    Err(format!("Telegram API error {}: {}", status, result))
+                }
+            })
+            .join()
+            .map_err(|_| "thread panicked".to_string())?
+        })
+    }
 }
 
 /// Add outlayer host functions to a wasmtime component linker

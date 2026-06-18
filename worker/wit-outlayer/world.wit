@@ -1,4 +1,4 @@
-package outlayer:api;
+package outlayer:api@0.1.0;
 
 interface host {
     view: func(contract-id: string, method-name: string, args-json: string) -> result<string, string>;
@@ -24,6 +24,10 @@ interface host {
     env-predecessor: func() -> string;
     env-get: func(key: string) -> option<string>;
     sleep-ms: func(ms: u32) -> result<_, string>;
+
+    /// Send a Telegram message via bot API
+    /// Reads TELEGRAM_BOT_TOKEN from environment
+    send-telegram: func(chat-id: string, text: string) -> result<string, string>;
 }
 
 world outlayer-world {
