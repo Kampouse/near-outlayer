@@ -145,8 +145,11 @@ impl outlayer::api::host::Host for OutlayerHostState {
                     .post(&url)
                     .header("Content-Type", &content_type);
                 // Auto-inject auth headers from environment
-                if url.contains("api.z.ai") || url.contains("openai.com") || url.contains("anthropic.com") {
-                    if let Ok(key) = std::env::var("GLM_API_KEY") {
+                if url.contains("api.z.ai")
+                    || url.contains("openai.com")
+                    || url.contains("anthropic.com")
+                {
+                    if let Ok(key) = std::env::var("AI_API_KEY") {
                         req = req.header("Authorization", format!("Bearer {}", key));
                     }
                 }
