@@ -305,24 +305,27 @@ impl outlayer::api::host::Host for OutlayerHostState {
     }
 
     fn send_telegram(&mut self, chat_id: String, text: String) -> Result<String, String> {
+        eprintln!("[send-telegram] CALLED! chat={} text={}", chat_id, text);
         let token = std::env::var("TELEGRAM_BOT_TOKEN")
-            .map_err(|_| "TELEGRAM_BOT_TOKEN not set".to_string())?;
+            .map_err(|e| { eprintln!("[send-telegram] TOKEN ERROR: {}", e); "TELEGRAM_BOT_TOKEN not set".to_string() })?;
         let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
         let body = serde_json::json!({"chat_id": chat_id, "text": &text});
-        debug!("[send-telegram] chat={} text_len={}", chat_id, text.len());
+        eprintln!("[send-telegram] POST {}", url);
         std::thread::scope(|s| {
             s.spawn(move || {
                 let resp = reqwest::blocking::Client::builder()
                     .timeout(std::time::Duration::from_secs(10))
                     .build()
-                    .map_err(|e| e.to_string())?
+                    .map_err(|e| { eprintln!("[send-telegram] CLIENT BUILD ERROR: {}", e); e.to_string() })?
                     .post(&url)
                     .header("Content-Type", "application/json")
                     .json(&body)
                     .send()
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| { eprintln!("[send-telegram] HTTP ERROR: {}", e); e.to_string() })?;
                 let status = resp.status();
-                let result: serde_json::Value = resp.json().map_err(|e| e.to_string())?;
+                eprintln!("[send-telegram] HTTP STATUS: {}", status);
+                let result: serde_json::Value = resp.json().map_err(|e| { eprintln!("[send-telegram] JSON PARSE ERROR: {}", e); e.to_string() })?;
+                eprintln!("[send-telegram] RESPONSE: {}", result);
                 if status.is_success() {
                     Ok(result.to_string())
                 } else {
@@ -330,7 +333,7 @@ impl outlayer::api::host::Host for OutlayerHostState {
                 }
             })
             .join()
-            .map_err(|_| "thread panicked".to_string())?
+            .map_err(|e| { eprintln!("[send-telegram] THREAD PANIC: {:?}", e); "thread panicked".to_string() })?
         })
     }
 }
