@@ -384,8 +384,17 @@ fn cmd_serve(config_dir: &Path, wasm_name: &str, rpc_override: Option<&str>) -> 
             eprintln!("❌ Error: {}", error);
         }
 
-        // Brief pause between cycles
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Adaptive pause: longer when idle (empty/no-op output), short when active
+        let idle = match &result.output {
+            Some(ExecutionOutput::Text(t)) if t.is_empty() || t == "nil" || t.contains("No intentions") => true,
+            _ => false,
+        };
+        let pause = if idle {
+            std::time::Duration::from_secs(30) // 30s when nothing to do
+        } else {
+            std::time::Duration::from_millis(500) // 500ms when active
+        };
+        std::thread::sleep(pause);
     }
 
     eprintln!("Stopped after {} cycles.", cycle);
