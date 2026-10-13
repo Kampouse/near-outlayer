@@ -195,8 +195,23 @@ impl Contract {
             "project_id": project_id
         });
 
-        // Create a placeholder data_id (no yield promise for local testing)
-        let data_id: CryptoHash = CryptoHash::default();
+        // Create yield promise to pause execution until the worker resolves.
+        // The resumed frame is on_execution_response: it settles payment and
+        // value_returns the output, so any caller's .then() callback reads it
+        // via promise_result (the oracle pattern, as deployed on mainnet).
+        let promise_idx = env::promise_yield_create(
+            "on_execution_response",
+            &request_data.to_string().into_bytes(),
+            MIN_RESPONSE_GAS,
+            GasWeight::default(),
+            DATA_ID_REGISTER,
+        );
+
+        // Get data_id for resume
+        let data_id: CryptoHash = env::read_register(DATA_ID_REGISTER)
+            .expect("Failed to read data_id")
+            .try_into()
+            .expect("Invalid data_id");
         // Store the pending execution request
         // Note: sender_id in ExecutionRequest stores predecessor (contract that called us)
         // This is used for authorization checks (cancel_stale_execution)
@@ -224,7 +239,9 @@ impl Contract {
         // Emit event for workers to catch
         events::emit::execution_requested(&self.event_standard, &self.event_version, &request_data.to_string(), data_id);
 
-        // No yield promise - worker resolves via resolve_execution
+        // Return the yield promise: execution pauses here; the worker resolves
+        // via resolve_execution, which resumes on_execution_response.
+        env::promise_return(promise_idx);
     }
 
 
@@ -742,8 +759,15 @@ impl Contract {
         // Log cost in easy-to-parse format for worker
         log!("[[yNEAR charged: \"{}\"]]", estimated_cost);
 
-        // For local testing: no yield resume, just store result and remove pending
-        // In production, this would call promise_yield_resume
-        self.pending_requests.remove(&request_id);
+        // Resume the paused request_execution: on_execution_response settles
+        // payment and value_returns the output to the caller's .then() chain.
+        // Small response rides the resume payload; large outputs stay in
+        // pending_output (submitted via submit_execution_output) and the
+        // callback retrieves them from storage.
+        // NOTE: do NOT remove the pending request here — on_execution_response
+        // (the resumed callback) removes it after settling payment.
+        if !env::promise_yield_resume(&data_id, &serde_json::to_vec(&response).unwrap()) {
+            env::panic_str("Unable to resume execution promise");
+        }
     }
 }
